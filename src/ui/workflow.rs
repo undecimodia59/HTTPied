@@ -1,0 +1,1373 @@
+use super::*;
+use crate::{
+    browser,
+    control::{Decision, Interception, Pending},
+    jobs::{Job, ResultEvent},
+    replay,
+};
+use std::{net::SocketAddr, time::Duration};
+
+static NEXT_EDITOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+#[derive(Clone, Copy, PartialEq)]
+enum PayloadMode {
+    Text,
+    Numbers,
+    File,
+    Charset,
+    Random,
+}
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Tab {
+    Intercept,
+    History,
+    Replay,
+    Intruder,
+    Browser,
+    Target,
+    Settings,
+    Variables,
+    Compare,
+    Project,
+    Results,
+}
+struct Held {
+    pending: Pending,
+    text: String,
+    editable: bool,
+    original: String,
+}
+pub(super) struct Tool {
+    pub destination: String,
+    pub request: String,
+    name: String,
+    baseline: String,
+    baseline_destination: String,
+    group: String,
+    timeout_secs: u64,
+    response_bytes: Vec<u8>,
+    response_mode: u8,
+    response_find: String,
+    last_target: String,
+    response: String,
+    status: String,
+    editor_id: u64,
+    repair: bool,
+}
+impl Tool {
+    fn response_view(&self) -> String {
+        match self.response_mode {
+            1 => crate::exchange::pretty(&preview(&self.response_bytes, PREVIEW)),
+            2 => hex_preview(&self.response_bytes),
+            3 => crate::exchange::decoded(&self.response_bytes)
+                .unwrap_or_else(|e| format!("Decoded view unavailable: {e}")),
+            _ => preview(&self.response_bytes, PREVIEW),
+        }
+    }
+    fn new() -> Self {
+        Self {
+            name: "Request".into(),
+            baseline: "GET / HTTP/1.1\r\n\r\n".into(),
+            baseline_destination: String::new(),
+            group: String::new(),
+            timeout_secs: 0,
+            response_bytes: Vec::new(),
+            response_mode: 0,
+            response_find: String::new(),
+            last_target: String::new(),
+            destination: String::new(),
+            request: "GET / HTTP/1.1\r\n\r\n".into(),
+            response: String::new(),
+            status: "Ready".into(),
+            editor_id: NEXT_EDITOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            repair: true,
+        }
+    }
+}
+pub(super) struct Workflow {
+    pub tab: Tab,
+    pub variables: Vec<crate::state::Variable>,
+    pub scope: Vec<crate::state::ScopeRule>,
+    pub settings: crate::state::Settings,
+    pub control: Interception,
+    pending_rx: mpsc::Receiver<Pending>,
+    held: VecDeque<Held>,
+    replays: Vec<Tool>,
+    selected_replay: usize,
+    intruder: Tool,
+    payloads: String,
+    attack_mode: crate::attack::Mode,
+    encoding: crate::attack::Encoding,
+    positions: usize,
+    extra_payloads: Vec<String>,
+    defaults: Vec<String>,
+    prefix: String,
+    suffix: String,
+    pause: Option<watch::Sender<bool>>,
+    pub completed: VecDeque<crate::jobs::Record>,
+    matcher: String,
+    stop_on_match: bool,
+    payload_mode: PayloadMode,
+    number_start: String,
+    number_end: String,
+    number_step: String,
+    alphabet: String,
+    generated_width: usize,
+    generated_count: usize,
+    generated_seed: u64,
+    file_worker: crate::payload::FileWorker,
+    file_path: String,
+    file_values: Option<std::sync::Arc<Vec<String>>>,
+    file_busy: bool,
+    jobs: mpsc::Sender<Job>,
+    results: mpsc::Receiver<ResultEvent>,
+    active: Option<(u64, Tab, watch::Sender<bool>)>,
+    next_job: u64,
+    browser_tx: Option<std::sync::mpsc::SyncSender<browser::Action>>,
+    browser_rx: Option<std::sync::mpsc::Receiver<String>>,
+    browser_status: String,
+    pub listen: SocketAddr,
+    message: String,
+}
+impl Workflow {
+    pub fn new(
+        control: Interception,
+        pending_rx: mpsc::Receiver<Pending>,
+        jobs: mpsc::Sender<Job>,
+        results: mpsc::Receiver<ResultEvent>,
+        listen: SocketAddr,
+    ) -> Self {
+        Self {
+            tab: Tab::Intercept,
+            variables: Vec::new(),
+            scope: Vec::new(),
+            settings: Default::default(),
+            control,
+            pending_rx,
+            held: VecDeque::new(),
+            replays: vec![Tool::new()],
+            selected_replay: 0,
+            intruder: Tool::new(),
+            payloads: String::new(),
+            attack_mode: Default::default(),
+            encoding: Default::default(),
+            positions: 1,
+            extra_payloads: vec![String::new(); 3],
+            defaults: vec![String::new(); 4],
+            prefix: String::new(),
+            suffix: String::new(),
+            pause: None,
+            completed: VecDeque::new(),
+            matcher: String::new(),
+            stop_on_match: false,
+            payload_mode: PayloadMode::Text,
+            number_start: "0".into(),
+            number_end: "100".into(),
+            number_step: "1".into(),
+            alphabet: "0123456789abcdef".into(),
+            generated_width: 4,
+            generated_count: 100,
+            generated_seed: 1,
+            file_worker: crate::payload::FileWorker::start(),
+            file_path: String::new(),
+            file_values: None,
+            file_busy: false,
+            jobs,
+            results,
+            active: None,
+            next_job: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            browser_tx: None,
+            browser_rx: None,
+            browser_status: "Not launched".into(),
+            listen,
+            message: String::new(),
+        }
+    }
+    pub(super) fn restore(&mut self, state: &crate::state::ProjectState) {
+        self.settings = state.settings.clone();
+        self.variables = state.variables.clone();
+        self.scope = state.scope.clone();
+        if !state.replays.is_empty() {
+            self.replays = state
+                .replays
+                .iter()
+                .take(8)
+                .map(|saved| {
+                    let mut tool = Tool::new();
+                    tool.destination = saved.destination.clone();
+                    tool.request = saved.request.clone();
+                    tool.baseline = saved.request.clone();
+                    tool.name = saved.name.clone();
+                    tool.group = saved.group.clone();
+                    tool.timeout_secs = saved.timeout_secs;
+                    tool.baseline_destination = saved.destination.clone();
+                    tool
+                })
+                .collect();
+            self.selected_replay = 0;
+        }
+    }
+    pub(super) fn mark_saved(&mut self, saved: &[crate::state::SavedRequest]) {
+        for tool in &mut self.replays {
+            if saved
+                .iter()
+                .any(|s| s.request == tool.request && s.destination == tool.destination)
+            {
+                tool.baseline = tool.request.clone();
+                tool.baseline_destination = tool.destination.clone();
+            }
+        }
+    }
+    pub(super) fn stop(&self) {
+        if let Some((_, _, cancel)) = &self.active {
+            cancel.send_replace(true);
+        }
+    }
+    pub(super) fn saved_requests(&self) -> Vec<crate::state::SavedRequest> {
+        self.replays
+            .iter()
+            .map(|tool| crate::state::SavedRequest {
+                name: tool.name.clone(),
+                group: tool.group.clone(),
+                timeout_secs: tool.timeout_secs,
+                destination: tool.destination.clone(),
+                request: tool.request.clone(),
+            })
+            .collect()
+    }
+    pub fn offline(listen: SocketAddr) -> Self {
+        let (control, pending) = Interception::channel(16, Duration::from_secs(60));
+        let (jobs, _) = mpsc::channel(2);
+        let (_, results) = mpsc::channel(2);
+        Self::new(control, pending, jobs, results, listen)
+    }
+    pub fn set_browser(
+        &mut self,
+        tx: std::sync::mpsc::SyncSender<browser::Action>,
+        rx: std::sync::mpsc::Receiver<String>,
+    ) {
+        self.browser_tx = Some(tx);
+        self.browser_rx = Some(rx);
+    }
+    fn poll(&mut self) -> Vec<Event> {
+        self.held.retain(|held| !held.pending.decision.is_closed());
+        while self.held.len() < 16 {
+            let Ok(pending) = self.pending_rx.try_recv() else {
+                break;
+            };
+            if pending.decision.is_closed() {
+                continue;
+            }
+            let editable = std::str::from_utf8(&pending.request).is_ok();
+            let text = preview(&pending.request, 128 * 1024);
+            self.held.push_back(Held {
+                original: text.clone(),
+                text,
+                pending,
+                editable,
+            });
+        }
+        if let Some(rx) = &self.browser_rx {
+            while let Ok(message) = rx.try_recv() {
+                self.browser_status = message;
+            }
+        }
+        while let Ok(loaded) = self.file_worker.results.try_recv() {
+            self.file_busy = false;
+            match loaded.result {
+                Ok(Some(values)) => {
+                    self.file_path = loaded
+                        .path
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default();
+                    self.file_values = Some(values);
+                    self.message.clear();
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.file_values = None;
+                    self.message = format!("Wordlist: {error}");
+                }
+            }
+        }
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            let Ok(result) = self.results.try_recv() else {
+                break;
+            };
+            let Some((id, tab, _)) = &self.active else {
+                continue;
+            };
+            if *id != result.id {
+                continue;
+            }
+            let tab = *tab;
+            if tab == Tab::Intruder && !result.terminal {
+                let (status, bytes, error, matched) = match &result.result {
+                    Ok(e) => (
+                        e.response_status,
+                        e.response_total_bytes,
+                        String::new(),
+                        !self.matcher.is_empty()
+                            && e.response
+                                .windows(self.matcher.len())
+                                .any(|w| w == self.matcher.as_bytes()),
+                    ),
+                    Err(error) => (0, 0, error.clone(), false),
+                };
+                self.completed.push_back(crate::jobs::Record {
+                    capture_id: None,
+                    run_id: result.id,
+                    index: result.index,
+                    total: result.total,
+                    payloads: result.payloads.clone(),
+                    status,
+                    bytes,
+                    elapsed_ms: result.elapsed.as_secs_f64() * 1000.0,
+                    error,
+                    matched,
+                });
+            }
+            let tool = if tab == Tab::Replay {
+                &mut self.replays[self.selected_replay]
+            } else {
+                &mut self.intruder
+            };
+            let (response, summary) = match result.result {
+                Ok(execution) => {
+                    tool.response_bytes = execution.response
+                        [..execution.response.len().min(2 * 1024 * 1024)]
+                        .to_vec();
+                    tool.last_target = execution.parsed.target.clone();
+                    let response = tool.response_view();
+                    let summary = format!(
+                        "{}/{}  HTTP {}  {:.1} ms  {}{}",
+                        result.index + 1,
+                        result.total,
+                        execution.response_status,
+                        result.elapsed.as_secs_f64() * 1000.0,
+                        crate::state::size(
+                            execution.response_total_bytes,
+                            self.settings.binary_units
+                        ),
+                        if execution.response_truncated || execution.response.len() > PREVIEW {
+                            " (preview truncated)"
+                        } else {
+                            ""
+                        }
+                    );
+                    events.push(Event::Exchange(execution));
+                    (response, summary)
+                }
+                Err(error) => (
+                    error.clone(),
+                    format!("{}/{}  {error}", result.index + 1, result.total),
+                ),
+            };
+            tool.response = response;
+            tool.status = summary;
+            if result.done {
+                self.active = None;
+            }
+        }
+        events
+    }
+    fn launch_browser(&mut self) {
+        let Some(tx) = &self.browser_tx else {
+            self.browser_status = "Browser worker unavailable".into();
+            return;
+        };
+        match tx.try_send(browser::Action::Launch {
+            executable: self.settings.browser.clone(),
+            proxy: self.listen,
+            url: self.settings.browser_url.clone(),
+        }) {
+            Ok(()) => self.browser_status = "Launching…".into(),
+            Err(error) => self.browser_status = error.to_string(),
+        }
+    }
+    pub(super) fn load(&mut self, bytes: &[u8], tab: Tab) {
+        if bytes.len() > 128 * 1024 {
+            self.message =
+                "Request exceeds the 128 KiB editor limit; it was not truncated or loaded.".into();
+            return;
+        }
+        match replay::origin_draft(bytes) {
+            Ok((destination, request)) => {
+                if self
+                    .active
+                    .as_ref()
+                    .is_some_and(|(_, active, _)| *active == tab)
+                {
+                    self.message =
+                        "Wait for the active run or cancel it before replacing its request.".into();
+                    return;
+                }
+                if tab == Tab::Replay {
+                    if self.replays.len() >= 8 {
+                        self.message =
+                            "Replay has 8 sessions. Close one before sending another request."
+                                .into();
+                        return;
+                    }
+                    self.replays.push(Tool::new());
+                    self.selected_replay = self.replays.len() - 1;
+                }
+                let tool = if tab == Tab::Replay {
+                    &mut self.replays[self.selected_replay]
+                } else {
+                    &mut self.intruder
+                };
+                tool.destination = destination;
+                tool.request = request;
+                tool.response.clear();
+                tool.status = "Loaded from History".into();
+                self.tab = tab;
+                self.message.clear();
+            }
+            Err(error) => self.message = error.to_string(),
+        }
+    }
+    pub(super) fn load_execution(&mut self, execution: &crate::model::WireExecution, tab: Tab) {
+        match replay::executed_request(execution) {
+            Ok(bytes) => self.load(&bytes, tab),
+            Err(error) => self.message = error.to_string(),
+        }
+    }
+    pub(super) fn load_result(&mut self, bytes: std::io::Result<Vec<u8>>, tab: Tab) {
+        match bytes {
+            Ok(bytes) => self.load(&bytes, tab),
+            Err(error) => self.message = error.to_string(),
+        }
+    }
+    fn make_plan(&self) -> Result<crate::attack::Plan, String> {
+        let primary = match self.payload_mode {
+            PayloadMode::Text => crate::payload::Payloads::lines(std::sync::Arc::new(
+                self.payloads.lines().map(str::to_owned).collect(),
+            )),
+            PayloadMode::Numbers => crate::payload::Payloads::numbers(
+                &self.number_start,
+                &self.number_end,
+                &self.number_step,
+            ),
+            PayloadMode::Charset => crate::payload::Payloads::generated(
+                &self.alphabet,
+                self.generated_width,
+                None,
+                None,
+            ),
+            PayloadMode::Random => crate::payload::Payloads::generated(
+                &self.alphabet,
+                self.generated_width,
+                Some(self.generated_count),
+                Some(self.generated_seed),
+            ),
+            PayloadMode::File => self
+                .file_values
+                .clone()
+                .ok_or_else(|| std::io::Error::other("Load a wordlist first"))
+                .and_then(crate::payload::Payloads::lines),
+        }
+        .map_err(|e| e.to_string())?;
+        let mut sources = vec![primary.clone()];
+        for text in self.extra_payloads.iter().take(self.positions - 1) {
+            sources.push(if text.is_empty() {
+                primary.clone()
+            } else {
+                crate::payload::Payloads::lines(std::sync::Arc::new(
+                    text.lines().map(str::to_owned).collect(),
+                ))
+                .map_err(|e| e.to_string())?
+            });
+        }
+        let mut plan = crate::attack::Plan::new(sources, self.attack_mode)?;
+        plan.encoding = self.encoding;
+        plan.prefix = self.prefix.clone();
+        plan.suffix = self.suffix.clone();
+        plan.defaults = self.defaults[..self.positions].to_vec();
+        Ok(plan)
+    }
+    pub(super) fn start_job(&mut self, tab: Tab) {
+        if tab == Tab::Intruder && self.payload_mode == PayloadMode::File && self.file_busy {
+            self.message = "Wait for the wordlist to finish loading.".into();
+            return;
+        }
+        if self.active.is_some() {
+            self.message = "One execution job can run at a time. Cancel it or wait.".into();
+            return;
+        }
+        let plan = if tab == Tab::Intruder {
+            match self.make_plan() {
+                Ok(plan) => Some(plan),
+                Err(error) => {
+                    self.message = error;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let tool = if tab == Tab::Replay {
+            &mut self.replays[self.selected_replay]
+        } else {
+            &mut self.intruder
+        };
+        let mut variables = self.variables.clone();
+        if tab == Tab::Intruder {
+            for slot in 0..self.positions {
+                let key = if slot == 0 {
+                    "payload".into()
+                } else {
+                    format!("payload{}", slot + 1)
+                };
+                variables.push(crate::state::Variable {
+                    value: format!("{{{{{key}}}}}"),
+                    key,
+                    secret: false,
+                    enabled: true,
+                });
+            }
+        }
+        let resolved =
+            crate::state::resolve(&tool.destination, &variables).and_then(|destination| {
+                crate::state::resolve(&tool.request, &variables)
+                    .map(|request| (destination, request))
+            });
+        let (destination, request) = match resolved {
+            Ok(value) => value,
+            Err(error) => {
+                self.message = error;
+                return;
+            }
+        };
+        let requests = if tab == Tab::Intruder {
+            for slot in 0..self.positions {
+                let marker = if slot == 0 {
+                    "{{payload}}".into()
+                } else {
+                    format!("{{{{payload{}}}}}", slot + 1)
+                };
+                if !request.contains(&marker) {
+                    self.message = format!("Insert {marker} in the request");
+                    return;
+                }
+            }
+            crate::jobs::Requests::Multi {
+                destination: destination.clone(),
+                template: request.clone(),
+                repair: tool.repair,
+                plan: plan.unwrap(),
+            }
+        } else {
+            match replay::build(&destination, &request, tool.repair) {
+                Ok(request) => vec![request].into(),
+                Err(error) => {
+                    self.message = error.to_string();
+                    return;
+                }
+            }
+        };
+        let (cancel, rx) = watch::channel(false);
+        let (pause, pause_rx) = watch::channel(false);
+        self.pause = Some(pause);
+        let id = self.next_job;
+        self.next_job += 1;
+        match self.jobs.try_send(Job {
+            id,
+            requests,
+            delay: Duration::from_millis(self.settings.delay_ms),
+            cancel: rx,
+            pause: Some(pause_rx),
+            options: crate::jobs::Options {
+                timeout_secs: tool.timeout_secs,
+                concurrency: self.settings.concurrency,
+                retries: self.settings.retries,
+                backoff: Duration::from_millis(self.settings.backoff_ms),
+                enforce_scope: self.settings.enforce_scope,
+                scope: self.scope.clone(),
+                global_rps: self.settings.global_rps,
+                host_rps: self.settings.host_rps,
+                matcher: self.matcher.clone(),
+                stop_on_match: self.stop_on_match,
+            },
+        }) {
+            Ok(()) => {
+                self.active = Some((id, tab, cancel));
+                tool.status = "Running…".into();
+                self.message.clear();
+            }
+            Err(error) => self.message = error.to_string(),
+        }
+    }
+    fn intercept(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let enabled = self.control.enabled();
+            let label = if enabled {
+                "Intercept: ON"
+            } else {
+                "Intercept: OFF"
+            };
+            if ui
+                .add(egui::Button::new(label).fill(if enabled {
+                    egui::Color32::from_rgb(49, 65, 87)
+                } else {
+                    SURFACE
+                }))
+                .clicked()
+            {
+                self.control.set_enabled(!enabled);
+            }
+            ui.label(format!("{} held", self.held.len()));
+        });
+        muted(
+            ui,
+            "Requests matching your interception rules pause here. Response buffering is limited to 128 KiB.",
+        );
+        let mut action = None;
+        if let Some(held) = self.held.front_mut() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(format!(
+                    "{} #{} • {}",
+                    if held.pending.response {
+                        "Response"
+                    } else {
+                        "Request"
+                    },
+                    held.pending.id,
+                    held.pending.authority
+                ));
+                muted(
+                    ui,
+                    format!(
+                        "{} s remaining",
+                        held.pending
+                            .deadline
+                            .saturating_duration_since(std::time::Instant::now())
+                            .as_secs()
+                    ),
+                );
+                if ui.button("Forward").clicked() {
+                    if held.text == held.original {
+                        action = Some(Decision::Forward);
+                    } else {
+                        match if held.pending.response {
+                            crate::response::repair(held.text.as_bytes(), false)
+                        } else {
+                            replay::build(&held.pending.destination, &held.text, true)
+                        } {
+                            Ok(bytes) => action = Some(Decision::Edit(bytes)),
+                            Err(error) => self.message = error.to_string(),
+                        }
+                    }
+                }
+                if ui.button("Forward without edits").clicked() {
+                    action = Some(Decision::Forward);
+                }
+                if ui.button("Drop").clicked() {
+                    action = Some(Decision::Drop);
+                }
+            });
+            if !held.editable {
+                ui.colored_label(
+                    WARN,
+                    "Binary request: editing disabled; forward original or drop.",
+                );
+            }
+            card().show(ui, |ui| {
+                egui::ScrollArea::both()
+                    .max_height((ui.available_height() - 100.0).max(180.0))
+                    .show(ui, |ui| {
+                        syntax::editor(
+                            ui,
+                            egui::Id::new(("held", held.pending.id)),
+                            &mut held.text,
+                            held.editable,
+                            24,
+                        );
+                    });
+            });
+        } else {
+            ui.label(if self.control.enabled() {
+                "Waiting for an HTTP request…"
+            } else {
+                "Interception is off."
+            });
+        }
+        if let Some(decision) = action
+            && let Some(held) = self.held.pop_front()
+        {
+            let _ = held.pending.decision.send(decision);
+            self.message.clear();
+        }
+    }
+    fn tool(&mut self, ui: &mut egui::Ui, tab: Tab) {
+        let active = self.active.is_some();
+        let mut send = false;
+        let mut cancel = false;
+        if active
+            && tab == Tab::Intruder
+            && let Some(pause) = &self.pause
+        {
+            let paused = *pause.borrow();
+            if ui.button(if paused { "Resume" } else { "Pause" }).clicked() {
+                pause.send_replace(!paused);
+            }
+        }
+        if tab == Tab::Intruder
+            && let Ok(plan) = self.make_plan()
+        {
+            ui.label(format!(
+                "Planned: {} requests to {} · {} ms delay · concurrency {}",
+                plan.len(),
+                self.intruder.destination,
+                self.settings.delay_ms,
+                self.settings.concurrency
+            ));
+        }
+        if tab == Tab::Replay {
+            ui.add_enabled_ui(!active, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for index in 0..self.replays.len() {
+                        if ui
+                            .selectable_label(
+                                index == self.selected_replay,
+                                format!(
+                                    "{}{} {}{}",
+                                    if self.replays[index].group.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!("{}/", self.replays[index].group)
+                                    },
+                                    self.replays[index].name,
+                                    index + 1,
+                                    if self.replays[index].request != self.replays[index].baseline
+                                        || self.replays[index].destination
+                                            != self.replays[index].baseline_destination
+                                    {
+                                        " *"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                            )
+                            .clicked()
+                        {
+                            self.selected_replay = index;
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.replays.len() < 8, egui::Button::new("+ New"))
+                        .clicked()
+                    {
+                        self.replays.push(Tool::new());
+                        self.selected_replay = self.replays.len() - 1;
+                    }
+                    if ui
+                        .add_enabled(self.replays.len() < 8, egui::Button::new("Duplicate"))
+                        .clicked()
+                    {
+                        let current = &self.replays[self.selected_replay];
+                        let mut copy = Tool::new();
+                        copy.destination = current.destination.clone();
+                        copy.request = current.request.clone();
+                        copy.name = format!("{} copy", current.name);
+                        copy.group = current.group.clone();
+                        copy.timeout_secs = current.timeout_secs;
+                        self.replays.push(copy);
+                        self.selected_replay = self.replays.len() - 1;
+                    }
+                    if ui
+                        .add_enabled(self.selected_replay > 0, egui::Button::new("Left"))
+                        .on_hover_text("Move session left")
+                        .clicked()
+                    {
+                        let i = self.selected_replay;
+                        self.replays.swap(i, i - 1);
+                        self.selected_replay -= 1;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.selected_replay + 1 < self.replays.len(),
+                            egui::Button::new("Right"),
+                        )
+                        .on_hover_text("Move session right")
+                        .clicked()
+                    {
+                        let i = self.selected_replay;
+                        self.replays.swap(i, i + 1);
+                        self.selected_replay += 1;
+                    }
+                    if ui
+                        .add_enabled(self.replays.len() > 1, egui::Button::new("Close request"))
+                        .clicked()
+                    {
+                        let editor = self.replays[self.selected_replay].editor_id;
+                        syntax::forget_editor(ui.ctx(), egui::Id::new(("request", editor)));
+                        syntax::forget_editor(ui.ctx(), egui::Id::new(("response", editor)));
+                        self.replays.remove(self.selected_replay);
+                        self.selected_replay = self.selected_replay.min(self.replays.len() - 1);
+                    }
+                });
+            });
+        }
+        let tool = if tab == Tab::Replay {
+            &mut self.replays[self.selected_replay]
+        } else {
+            &mut self.intruder
+        };
+        ui.horizontal(|ui| {
+            if tab == Tab::Replay {
+                ui.add(
+                    egui::TextEdit::singleline(&mut tool.name)
+                        .desired_width(110.0)
+                        .char_limit(64),
+                );
+            }
+            ui.label("Destination");
+            ui.add_enabled(
+                !active,
+                egui::TextEdit::singleline(&mut tool.destination)
+                    .hint_text("http://host:port")
+                    .desired_width(340.0)
+                    .char_limit(2048),
+            );
+            send = ui
+                .add_enabled(
+                    !active
+                        && !(tab == Tab::Intruder
+                            && self.payload_mode == PayloadMode::File
+                            && self.file_busy),
+                    egui::Button::new(if tab == Tab::Replay {
+                        "Send"
+                    } else {
+                        "Start payloads"
+                    }),
+                )
+                .clicked();
+            cancel = ui
+                .add_enabled(active, egui::Button::new("Cancel"))
+                .clicked();
+            ui.add_enabled_ui(!active, |ui| {
+                ui.checkbox(&mut tool.repair, "Update Content-Length");
+            });
+        });
+        if tab == Tab::Intruder {
+            ui.add_enabled_ui(!active, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(
+                        &mut self.attack_mode,
+                        crate::attack::Mode::Sniper,
+                        "Sniper",
+                    );
+                    ui.selectable_value(
+                        &mut self.attack_mode,
+                        crate::attack::Mode::Pitchfork,
+                        "Pitchfork",
+                    );
+                    ui.selectable_value(
+                        &mut self.attack_mode,
+                        crate::attack::Mode::ClusterBomb,
+                        "Cluster bomb",
+                    );
+                    ui.label("Positions");
+                    ui.add(egui::DragValue::new(&mut self.positions).range(1..=4));
+                    ui.selectable_value(&mut self.encoding, crate::attack::Encoding::None, "Raw");
+                    ui.selectable_value(&mut self.encoding, crate::attack::Encoding::Url, "URL");
+                    ui.selectable_value(
+                        &mut self.encoding,
+                        crate::attack::Encoding::Base64,
+                        "Base64",
+                    );
+                });
+                ui.collapsing("Additional sets and transforms", |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Prefix");
+                        ui.text_edit_singleline(&mut self.prefix);
+                        ui.label("Suffix");
+                        ui.text_edit_singleline(&mut self.suffix);
+                    });
+                    for slot in 1..self.positions {
+                        ui.label(format!(
+                            "{{{{payload{}}}}} · one per line; empty uses primary set",
+                            slot + 1
+                        ));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.extra_payloads[slot - 1])
+                                .char_limit(16384)
+                                .desired_rows(2),
+                        );
+                    }
+                    ui.label("Sniper defaults for inactive positions");
+                    for slot in 0..self.positions {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("Position {}", slot + 1));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.defaults[slot])
+                                    .char_limit(4096),
+                            );
+                        });
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Response contains");
+                    ui.add(egui::TextEdit::singleline(&mut self.matcher).char_limit(256));
+                    ui.checkbox(&mut self.stop_on_match, "Stop on match");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Payloads");
+                    ui.selectable_value(&mut self.payload_mode, PayloadMode::Text, "Text");
+                    ui.selectable_value(&mut self.payload_mode, PayloadMode::Numbers, "Numbers");
+                    ui.selectable_value(&mut self.payload_mode, PayloadMode::File, "Wordlist");
+                    ui.selectable_value(
+                        &mut self.payload_mode,
+                        PayloadMode::Charset,
+                        "Character set",
+                    );
+                    ui.selectable_value(
+                        &mut self.payload_mode,
+                        PayloadMode::Random,
+                        "Seeded random",
+                    );
+                    ui.label("Insertion marker: {{payload}}");
+                });
+                match self.payload_mode {
+                    PayloadMode::Charset | PayloadMode::Random => {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Alphabet");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.alphabet)
+                                    .char_limit(1024)
+                                    .desired_width(220.0),
+                            );
+                            ui.label("Length");
+                            ui.add(egui::DragValue::new(&mut self.generated_width).range(1..=256));
+                            if self.payload_mode == PayloadMode::Random {
+                                ui.label("Count");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.generated_count)
+                                        .range(1..=1000000),
+                                );
+                                ui.label("Seed");
+                                ui.add(egui::DragValue::new(&mut self.generated_seed));
+                            }
+                        });
+                    }
+                    PayloadMode::Text => {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.payloads)
+                                .hint_text("One payload per line")
+                                .char_limit(16 * 1024)
+                                .desired_rows(3),
+                        );
+                    }
+                    PayloadMode::Numbers => {
+                        ui.horizontal(|ui| {
+                            ui.label("From");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.number_start)
+                                    .desired_width(130.0)
+                                    .char_limit(20),
+                            );
+                            ui.label("To");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.number_end)
+                                    .desired_width(130.0)
+                                    .char_limit(20),
+                            );
+                            ui.label("Step");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.number_step)
+                                    .desired_width(60.0)
+                                    .char_limit(20),
+                            );
+                        });
+                        match crate::payload::Payloads::numbers(
+                            &self.number_start,
+                            &self.number_end,
+                            &self.number_step,
+                        ) {
+                            Ok(mut source) => {
+                                let count = source.len();
+                                ui.label(format!(
+                                    "{count} payloads; first: {} (leading zeros preserved)",
+                                    source.next().unwrap_or_default()
+                                ));
+                            }
+                            Err(error) => {
+                                ui.colored_label(ERROR, error.to_string());
+                            }
+                        }
+                    }
+                    PayloadMode::File => {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !self.file_busy,
+                                    egui::TextEdit::singleline(&mut self.file_path)
+                                        .hint_text("Wordlist path")
+                                        .desired_width(450.0)
+                                        .char_limit(4096),
+                                )
+                                .changed()
+                            {
+                                self.file_values = None;
+                            }
+                            if ui
+                                .add_enabled(!self.file_busy, egui::Button::new("Browse…"))
+                                .clicked()
+                            {
+                                match self
+                                    .file_worker
+                                    .commands
+                                    .try_send(crate::payload::FileAction::Browse)
+                                {
+                                    Ok(()) => self.file_busy = true,
+                                    Err(error) => self.message = error.to_string(),
+                                }
+                            }
+                            if ui
+                                .add_enabled(!self.file_busy, egui::Button::new("Load"))
+                                .clicked()
+                            {
+                                match self.file_worker.commands.try_send(
+                                    crate::payload::FileAction::Load(self.file_path.clone().into()),
+                                ) {
+                                    Ok(()) => self.file_busy = true,
+                                    Err(error) => self.message = error.to_string(),
+                                }
+                            }
+                        });
+                        if self.file_busy {
+                            ui.label("Loading wordlist…");
+                        } else if let Some(values) = &self.file_values {
+                            ui.label(format!("{} payloads loaded", values.len()));
+                        }
+                    }
+                }
+            });
+        }
+        if tab == Tab::Replay {
+            ui.horizontal(|ui| {
+                if ui.button("Copy as cURL (redacted)").clicked() {
+                    let result = crate::state::resolve(&tool.destination, &self.variables)
+                        .and_then(|destination| {
+                            crate::state::resolve(&tool.request, &self.variables).and_then(
+                                |request| crate::interchange::curl(&destination, &request, true),
+                            )
+                        });
+                    match result {
+                        Ok(command) => ui.ctx().copy_text(command),
+                        Err(error) => self.message = error,
+                    }
+                }
+                if ui.button("Copy as cURL").clicked() {
+                    let result = crate::state::resolve(&tool.destination, &self.variables)
+                        .and_then(|destination| {
+                            crate::state::resolve(&tool.request, &self.variables).and_then(
+                                |request| crate::interchange::curl(&destination, &request, false),
+                            )
+                        });
+                    match result {
+                        Ok(command) => ui.ctx().copy_text(command),
+                        Err(error) => self.message = error,
+                    }
+                }
+            });
+            ui.collapsing("Resolved request preview", |ui| {
+                let mut masked = self.variables.clone();
+                for var in &mut masked {
+                    if var.secret {
+                        var.value = "[REDACTED]".into();
+                    }
+                }
+                match crate::state::resolve(&tool.destination, &masked).and_then(|destination| {
+                    crate::state::resolve(&tool.request, &masked)
+                        .map(|request| format!("{destination}\n{request}"))
+                }) {
+                    Ok(text) => {
+                        ui.monospace(text);
+                    }
+                    Err(error) => {
+                        ui.colored_label(ERROR, error);
+                    }
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.menu_button("Request options", |ui| {
+                ui.label("Group");
+                ui.add(
+                    egui::TextEdit::singleline(&mut tool.group)
+                        .char_limit(64)
+                        .min_size(egui::vec2(160.0, 20.0)),
+                );
+                ui.label("Timeout (seconds; 0 uses Settings)");
+                ui.add(egui::DragValue::new(&mut tool.timeout_secs).range(0..=86400));
+                ui.label("Redirects are not followed automatically.");
+            });
+        });
+        ui.label(&tool.status);
+        let width = ui.available_width();
+        let height = (ui.available_height() - 30.0).max(160.0);
+        let left = egui::Panel::left(egui::Id::new(("request-split", tool.editor_id)))
+            .resizable(true)
+            .default_size(width * self.settings.request_ratio)
+            .size_range(210.0..=(width - 210.0).max(210.0))
+            .show(ui, |ui| {
+                ui.strong("Request");
+                egui::ScrollArea::both()
+                    .id_salt(("tool-request", tool.editor_id))
+                    .max_height(height)
+                    .min_scrolled_height(height)
+                    .show(ui, |ui| {
+                        syntax::editor(
+                            ui,
+                            egui::Id::new(("request", tool.editor_id)),
+                            &mut tool.request,
+                            !active,
+                            25,
+                        );
+                    });
+            });
+        self.settings.request_ratio = (left.response.rect.width() / width).clamp(0.15, 0.85);
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("Response");
+                let previous = tool.response_mode;
+                for (mode, label) in [(0, "Raw"), (1, "Pretty"), (2, "Hex"), (3, "Decoded")] {
+                    ui.selectable_value(&mut tool.response_mode, mode, label);
+                }
+                if previous != tool.response_mode {
+                    tool.response = tool.response_view();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Find");
+                ui.add(
+                    egui::TextEdit::singleline(&mut tool.response_find)
+                        .desired_width(120.0)
+                        .char_limit(256),
+                );
+                if !tool.response_find.is_empty() {
+                    ui.label(format!(
+                        "{} matches",
+                        tool.response.matches(&tool.response_find).count()
+                    ));
+                }
+            });
+            egui::ScrollArea::both()
+                .id_salt(("tool-response", tool.editor_id))
+                .max_height(height)
+                .min_scrolled_height(height)
+                .show(ui, |ui| {
+                    syntax::editor(
+                        ui,
+                        egui::Id::new(("response", tool.editor_id)),
+                        &mut tool.response,
+                        false,
+                        25,
+                    );
+                });
+        });
+        if send {
+            self.start_job(tab);
+        }
+        if cancel && let Some((_, _, cancel)) = &self.active {
+            cancel.send_replace(true);
+        }
+    }
+    fn browser(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Browser");
+        ui.horizontal(|ui| {
+            ui.label("Executable");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings.browser)
+                    .hint_text("Auto-detect Chromium / Chrome, or enter its full executable path")
+                    .char_limit(2048)
+                    .desired_width(650.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Start URL");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.settings.browser_url)
+                    .char_limit(2048)
+                    .desired_width(650.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Launch browser").clicked() {
+                self.launch_browser();
+            }
+            if ui.button("Stop browser").clicked()
+                && let Some(tx) = &self.browser_tx
+            {
+                let _ = tx.try_send(browser::Action::Stop);
+            }
+        });
+        ui.label(&self.browser_status);
+        ui.label(format!("Proxy: http://{}", self.listen));
+        ui.label(
+            "HTTPS capture is configured in Settings; the test browser must trust the project CA.",
+        );
+        ui.collapsing("Browser details", |ui| {
+            ui.label("Uses an isolated temporary profile; your normal profile is not changed.");
+            ui.label("Certificate verification and the browser sandbox remain enabled.");
+            ui.label("Install Chromium/Chrome separately, or specify its executable above.");
+        });
+    }
+}
+impl Spike {
+    pub(super) fn workflow_content(&mut self, ui: &mut egui::Ui) {
+        if !self.features.importing && self.features.pending.len() < 16 {
+            for event in self.workflow.poll() {
+                self.receive(event);
+            }
+            while let Some(mut record) = self.workflow.completed.pop_front() {
+                record.capture_id =
+                    self.history
+                        .entries
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match &entry.event {
+                            Event::Exchange(e)
+                                if e.run.as_ref().is_some_and(|r| {
+                                    r.run_id == record.run_id && r.index == record.index
+                                }) =>
+                            {
+                                Some(entry.id)
+                            }
+                            _ => None,
+                        });
+                self.project_command(crate::project::Command::Result(record));
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("HTTPied").size(17.0).strong());
+            muted(ui, &self.status);
+            if let Some((_, _, cancel)) = &self.workflow.active
+                && ui.button("Stop execution").clicked()
+            {
+                cancel.send_replace(true);
+            }
+
+            if !self.workflow.held.is_empty() {
+                badge(
+                    ui,
+                    &format!(
+                        "{} request(s) waiting in Intercept",
+                        self.workflow.held.len()
+                    ),
+                    WARN,
+                );
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Open browser").clicked() {
+                    self.workflow.launch_browser();
+                    self.workflow.tab = Tab::Browser;
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [
+                (
+                    Tab::Intercept,
+                    format!(
+                        "Intercept  {}",
+                        if self.workflow.control.enabled() {
+                            "ON"
+                        } else {
+                            "OFF"
+                        }
+                    ),
+                ),
+                (
+                    Tab::History,
+                    format!("History  {}", self.history.entries.len()),
+                ),
+                (Tab::Replay, "Replay".into()),
+                (Tab::Intruder, "Intruder".into()),
+                (Tab::Browser, "Browser".into()),
+                (Tab::Target, "Target".into()),
+                (Tab::Variables, "Variables".into()),
+                (Tab::Compare, "Compare".into()),
+                (Tab::Results, "Results".into()),
+                (Tab::Project, "Project".into()),
+                (Tab::Settings, "Settings".into()),
+            ] {
+                if ui
+                    .add_sized(
+                        [90.0, 30.0],
+                        egui::Button::new(label).selected(self.workflow.tab == tab),
+                    )
+                    .clicked()
+                {
+                    self.workflow.tab = tab;
+                }
+            }
+        });
+        ui.separator();
+        match self.workflow.tab {
+            Tab::Intercept => self.workflow.intercept(ui),
+            Tab::History => self.workspace(ui),
+            Tab::Replay => {
+                self.workflow.tool(ui, Tab::Replay);
+                self.features.state.settings.request_ratio = self.workflow.settings.request_ratio;
+            }
+            Tab::Intruder => {
+                self.workflow.tool(ui, Tab::Intruder);
+                self.features.state.settings.request_ratio = self.workflow.settings.request_ratio;
+            }
+            Tab::Browser => {
+                self.workflow.browser(ui);
+                self.features.state.settings.browser = self.workflow.settings.browser.clone();
+                self.features.state.settings.browser_url =
+                    self.workflow.settings.browser_url.clone();
+            }
+            _ => self.feature_tab(ui),
+        }
+        if !self.features.message.is_empty() {
+            ui.colored_label(WARN, &self.features.message);
+        }
+        if !self.workflow.message.is_empty() {
+            ui.colored_label(ERROR, &self.workflow.message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn an_in_flight_wordlist_cannot_dispatch_a_stale_source() {
+        let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());
+        workflow.payload_mode = PayloadMode::File;
+        workflow.file_busy = true;
+        workflow.file_values = Some(std::sync::Arc::new(vec!["old".into()]));
+        workflow.start_job(Tab::Intruder);
+        assert!(workflow.active.is_none());
+        assert!(workflow.message.contains("finish loading"));
+    }
+    #[test]
+    fn history_transfer_creates_bounded_independent_replay_sessions() {
+        let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());
+        for index in 0..7 {
+            workflow.load(
+                format!("GET http://local/{index} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes(),
+                Tab::Replay,
+            );
+        }
+        assert_eq!(workflow.replays.len(), 8);
+        assert!(workflow.replays[1].request.starts_with("GET /0"));
+        assert!(workflow.replays[7].request.starts_with("GET /6"));
+        workflow.load(
+            b"GET http://local/overflow HTTP/1.1\r\nHost: local\r\n\r\n",
+            Tab::Replay,
+        );
+        assert_eq!(workflow.replays.len(), 8);
+        assert!(workflow.message.contains("8 sessions"));
+    }
+}

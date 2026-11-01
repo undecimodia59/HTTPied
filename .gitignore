@@ -1,2 +1,6 @@
 .codex/**
 .codex
+/target/
+__pycache__/
+
+/dist/

@@ -1,0 +1,1 @@
+{"mode":"release CPU egui layout only; no window/input/presentation","logical_rows":100000,"max_rows_drawn_per_layout":13,"editor_bytes":35840,"warmup_frames":30,"samples":300,"median_ms":0.280478,"p95_ms":0.306948}

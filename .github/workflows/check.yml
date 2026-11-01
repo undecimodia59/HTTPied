@@ -1,0 +1,27 @@
+name: Native builds
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo test --locked --all-features
+      - if: runner.os == 'Linux'
+        run: bash scripts/package-linux.sh
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: httpied-${{ runner.os }}
+          path: dist/*

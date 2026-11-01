@@ -1,0 +1,28 @@
+{
+  "os": "Linux-7.3.0-1-default-x86_64-with-glibc2.44",
+  "cpu": "x86_64",
+  "logical_cpus": 16,
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28) (built from a source tarball)",
+  "binary": "target/release/httpied",
+  "runs": 1000,
+  "fixture": "127.0.0.1:35599",
+  "mode": "release expected; headless, bounded capture drained, 2-byte response",
+  "startup_condition": "10 fresh process launches; OS cache NOT flushed; warm filesystem",
+  "startup_to_ready": {
+    "median_ms": 1.0833455000920367,
+    "p95_ms": 1.705783000033989
+  },
+  "idle_rss_linux": "VmRSS:\t    3700 kB",
+  "direct": {
+    "median_ms": 0.3360425,
+    "p95_ms": 0.517505
+  },
+  "proxied": {
+    "median_ms": 0.391397,
+    "p95_ms": 0.580063
+  },
+  "paired_overhead": {
+    "median_ms": 0.057924,
+    "p95_ms": 0.208483
+  }
+}
