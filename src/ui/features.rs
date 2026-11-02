@@ -23,6 +23,9 @@ pub(super) enum SettingsSection {
 }
 pub(super) struct Features {
     pub settings_section: SettingsSection,
+    pub(super) result_inspection: Option<crate::jobs::Record>,
+    pub(super) result_loading: bool,
+    pub(super) result_error: String,
     pub trust_pending: bool,
     pub trust_status: Option<Result<crate::trust::Status, String>>,
     history_dialog: Option<bool>,
@@ -93,6 +96,9 @@ impl Features {
     pub fn new() -> Self {
         Self {
             settings_section: SettingsSection::General,
+            result_inspection: None,
+            result_loading: false,
+            result_error: String::new(),
             trust_pending: false,
             trust_status: None,
             history_dialog: None,
@@ -165,6 +171,9 @@ impl Spike {
             if let Event::Exchange(execution) = &entry.event {
                 self.workflow
                     .load_result(crate::replay::executed_request(execution), tab);
+                if tab == Tab::Intruder && self.workflow.message.is_empty() {
+                    self.features.result_inspection = None;
+                }
             }
         } else {
             self.features.pending_transfer = Some((id, tab));
@@ -180,6 +189,9 @@ impl Spike {
             if let Event::Exchange(execution) = event {
                 self.workflow
                     .load_result(crate::replay::executed_request(execution), tab);
+                if tab == Tab::Intruder && self.workflow.message.is_empty() {
+                    self.features.result_inspection = None;
+                }
                 self.toast = None;
             }
         }
@@ -279,6 +291,23 @@ impl Spike {
                 Reply::Detail { id, event } => {
                     let event = *event;
                     self.finish_history_transfer(id, &event);
+                    let inspected_result =
+                        self.features
+                            .result_inspection
+                            .as_ref()
+                            .is_some_and(|record| {
+                                record.capture_id == Some(id)
+                                    || matches!(&event, Event::Exchange(execution)
+                            if execution.run.as_ref().is_some_and(|run|
+                                run.run_id == record.run_id && run.index == record.index))
+                            });
+                    if inspected_result {
+                        self.selected = Some(id);
+                        if let Some(record) = &mut self.features.result_inspection {
+                            record.capture_id = Some(id);
+                        }
+                        self.features.result_loading = false;
+                    }
                     if self.selected != Some(id) {
                         continue;
                     }
@@ -387,6 +416,11 @@ impl Spike {
                     self.features.busy = false;
                 }
                 Reply::Error(error) => {
+                    if self.features.result_loading {
+                        self.features.result_loading = false;
+                        self.features.result_error = error.clone();
+                        self.selected = None;
+                    }
                     self.features.pending_transfer = None;
                     self.features.results_busy = false;
                     self.features.importing = false;
@@ -1191,82 +1225,30 @@ impl Spike {
                 }
             }
         });
-        let mut selected = None;
-        let height = (ui.available_height() - 4.0).max(65.0);
-        egui::ScrollArea::both()
-            .id_salt("intruder-results-scroll")
-            .max_height(height)
-            .min_scrolled_height(65.0)
-            .show(ui, |ui| {
-                egui::Grid::new("intruder-results")
-                    .striped(true)
-                    .spacing([16.0, 7.0])
-                    .show(ui, |ui| {
-                        for (index, label) in [
-                            "Run", "#", "Payloads", "Status", "Size", "Duration", "Match", "Error",
-                        ]
-                        .iter()
-                        .enumerate()
-                        {
-                            if index == 0 && self.features.results_latest {
-                                continue;
-                            }
-                            let label = if self.features.results_sort == index {
-                                format!(
-                                    "{label} {}",
-                                    if self.features.results_reverse {
-                                        "v"
-                                    } else {
-                                        "^"
-                                    }
-                                )
-                            } else {
-                                label.to_string()
-                            };
-                            if ui.button(label).clicked() {
-                                if self.features.results_sort == index {
-                                    self.features.results_reverse = !self.features.results_reverse;
-                                } else {
-                                    self.features.results_sort = index;
-                                    self.features.results_reverse = false;
-                                }
-                            }
-                        }
-                        ui.end_row();
-                        for record in &self.features.results {
-                            if !self.features.results_latest {
-                                ui.label(record.run_id.to_string());
-                            }
-                            if ui
-                                .selectable_label(false, (record.index + 1).to_string())
-                                .clicked()
-                            {
-                                selected = record.capture_id;
-                            }
-                            ui.label(record.payloads.join(" | "));
-                            ui.label(if record.status == 0 {
-                                "—".into()
-                            } else {
-                                record.status.to_string()
-                            });
-                            ui.label(crate::state::size(
-                                record.bytes,
-                                self.features.state.settings.binary_units,
-                            ));
-                            ui.label(format!("{:.1} ms", record.elapsed_ms));
-                            ui.label(if record.matched { "yes" } else { "" });
-                            ui.label(&record.error);
-                            ui.end_row();
-                        }
-                    });
-                if self.features.results.is_empty() {
-                    ui.weak("No matching results.");
-                }
-            });
-        if let Some(id) = selected {
-            self.selected = Some(id);
-            self.project_command(Command::Detail(id));
-            self.workflow.tab = Tab::History;
+        let selected = self
+            .features
+            .result_inspection
+            .as_ref()
+            .map(|record| (record.run_id, record.index));
+        let action = super::results::table(
+            ui,
+            &self.features.results,
+            selected,
+            self.features.results_latest,
+            self.features.state.settings.binary_units,
+            self.features.results_sort,
+            self.features.results_reverse,
+        );
+        if let Some(index) = action.sort {
+            if self.features.results_sort == index {
+                self.features.results_reverse = !self.features.results_reverse;
+            } else {
+                self.features.results_sort = index;
+                self.features.results_reverse = false;
+            }
+        }
+        if let Some(index) = action.selected {
+            self.inspect_result(self.features.results[index].clone());
         }
         let fingerprint = serde_json::to_string(&self.result_filter()).unwrap_or_default();
         if fingerprint != self.features.results_fingerprint {
@@ -1524,6 +1506,28 @@ mod revision_tests {
                 .starts_with("GET /saved HTTP/1.1")
         );
         assert!(app.selected.is_none());
+    }
+    #[test]
+    fn editor_transfer_returns_intruder_to_the_loaded_attack_template() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut app = Spike::new(rx, "127.0.0.1:8080".parse().unwrap());
+        app.features.result_inspection = Some(crate::jobs::Record::default());
+        let context = egui::Context::default();
+        context.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("request-transfer"),
+                (
+                    true,
+                    Ok::<_, String>(syntax::RequestSource {
+                        destination: "https://local:8443".into(),
+                        request: "GET /{{payload}} HTTP/1.1\r\nHost: local\r\n\r\n".into(),
+                    }),
+                ),
+            )
+        });
+        app.receive_coder_selection(&context);
+        assert!(app.features.result_inspection.is_none());
+        assert!(app.workflow.tab == Tab::Intruder);
     }
     fn frame(app: &mut Spike) {
         let context = egui::Context::default();

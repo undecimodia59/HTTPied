@@ -14,6 +14,7 @@ pub(super) struct Inspector {
     request_next: usize,
     response_next: usize,
     note: Option<String>,
+    source: Result<syntax::RequestSource, String>,
 }
 impl Default for Inspector {
     fn default() -> Self {
@@ -31,6 +32,7 @@ impl Default for Inspector {
             request_next: 0,
             response_next: 0,
             note: None,
+            source: Err("No request selected".into()),
         }
     }
 }
@@ -108,6 +110,18 @@ impl Spike {
         );
         if key != self.inspect.key {
             self.inspect.key = key;
+            let wire = if self.inspect.original {
+                Ok(execution.original.0.clone())
+            } else {
+                crate::replay::executed_request(execution)
+            };
+            self.inspect.source = wire
+                .and_then(|wire| crate::replay::origin_draft(&wire))
+                .map(|(destination, request)| syntax::RequestSource {
+                    destination,
+                    request,
+                })
+                .map_err(|error| error.to_string());
             self.inspect.request = preview(
                 if self.inspect.original {
                     &execution.original.0
@@ -235,6 +249,8 @@ impl Spike {
                         });
                 });
                 let editor = egui::Id::new(("history-request", id));
+                syntax::wrap_control(ui, editor);
+                syntax::register_request(ui, editor, Some(self.inspect.source.clone()));
                 let jump = find(
                     ui,
                     editor,
@@ -284,6 +300,7 @@ impl Spike {
                     }
                 });
                 let editor = egui::Id::new(("history-response", id));
+                syntax::wrap_control(ui, editor);
                 let jump = find(
                     ui,
                     editor,

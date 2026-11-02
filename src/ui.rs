@@ -9,6 +9,7 @@ mod compare;
 mod features;
 mod history;
 mod log_view;
+mod results;
 mod settings;
 mod syntax;
 mod widgets;
@@ -1179,6 +1180,38 @@ impl Spike {
                 }
             });
         }
+        let editor_id = if self.pane == Pane::Draft {
+            egui::Id::new("history-draft")
+        } else {
+            egui::Id::new(("history-message", self.pane as u8))
+        };
+        let source = self.history.entries.iter().find_map(|entry| {
+            if Some(entry.id) != self.selected {
+                return None;
+            }
+            let Event::Exchange(execution) = &entry.event else {
+                return None;
+            };
+            let wire = match self.pane {
+                Pane::Original => Ok(execution.original.0.clone()),
+                Pane::Outgoing | Pane::Draft => crate::replay::executed_request(execution),
+                _ => return None,
+            };
+            Some(
+                wire.and_then(|wire| crate::replay::origin_draft(&wire))
+                    .map(|(destination, request)| syntax::RequestSource {
+                        destination,
+                        request: if self.pane == Pane::Draft {
+                            self.draft.clone()
+                        } else {
+                            request
+                        },
+                    })
+                    .map_err(|error| error.to_string()),
+            )
+        });
+        syntax::register_request(ui, editor_id, source);
+        syntax::wrap_control(ui, editor_id);
         card().show(ui, |ui| {
             let height = (ui.available_height() - 95.0).max(90.0);
             let mut scroll = egui::ScrollArea::both()
@@ -1221,9 +1254,6 @@ impl Spike {
                 }
             });
         });
-        ui.collapsing("Capture details & fidelity", |ui| {
-            muted(ui, &self.detail);
-        });
         muted(
             ui,
             "64 KiB text previews • captured bytes saved in the project",
@@ -1251,6 +1281,7 @@ impl eframe::App for Spike {
             egui::TextStyle::Monospace,
             egui::FontId::monospace(self.features.state.settings.font_size),
         );
+        syntax::set_default_wrap(ui.ctx(), self.features.state.settings.wrap_lines);
         self.capture_notices();
         self.log_panels(ui);
         egui::CentralPanel::default().show(ui, |ui| self.content(ui));

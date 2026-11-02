@@ -215,6 +215,28 @@ impl Spike {
         self.coder.page(ui);
     }
     pub(super) fn receive_coder_selection(&mut self, ctx: &egui::Context) {
+        let transfer = ctx.data_mut(|data| {
+            let key = egui::Id::new("request-transfer");
+            let value = data.get_temp::<(bool, Result<syntax::RequestSource, String>)>(key);
+            data.remove::<(bool, Result<syntax::RequestSource, String>)>(key);
+            value
+        });
+        if let Some((intruder, source)) = transfer {
+            match source {
+                Ok(source) => {
+                    self.workflow.load_draft(
+                        source.destination,
+                        source.request,
+                        if intruder { Tab::Intruder } else { Tab::Replay },
+                    );
+                    if intruder && self.workflow.message.is_empty() {
+                        self.features.result_inspection = None;
+                    }
+                }
+                Err(error) => self.workflow.message = error,
+            }
+            ctx.request_repaint();
+        }
         if let Some(text) = syntax::take_coder_selection(ctx) {
             self.coder.load(text);
             self.workflow.tab = Tab::Coder;

@@ -71,6 +71,10 @@ pub enum Command {
         scope: Vec<ScopeRule>,
     },
     Detail(u64),
+    FindResult {
+        run_id: u64,
+        index: usize,
+    },
     Export {
         path: PathBuf,
         format: String,
@@ -940,6 +944,29 @@ impl Project {
                     rows,
                 })
             }
+            Command::FindResult { run_id, index } => {
+                let id = self
+                    .db()
+                    .query_row(
+                        "SELECT id FROM captures
+                     WHERE json_extract(meta,'$.Exchange.run.run_id')=?1
+                       AND json_extract(meta,'$.Exchange.run.index')=?2
+                     ORDER BY id DESC LIMIT 1",
+                        params![run_id, index],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::QueryReturnedNoRows => {
+                            "The capture for this result is no longer available in the project"
+                                .to_owned()
+                        }
+                        _ => format!("Unable to load result capture: {error}"),
+                    })?;
+                Ok(Reply::Detail {
+                    id,
+                    event: Box::new(self.detail(id)?),
+                })
+            }
             Command::Detail(id) => Ok(Reply::Detail {
                 id,
                 event: Box::new(self.detail(id)?),
@@ -1060,6 +1087,50 @@ impl Project {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn results_without_a_capture_link_find_their_saved_execution() {
+        let mut project = super::Project::open(
+            std::path::PathBuf::new(),
+            true,
+            true,
+            "Result inspection".into(),
+        )
+        .unwrap();
+        let super::Event::Exchange(mut execution) = fixture() else {
+            panic!()
+        };
+        execution.run = Some(Box::new(crate::jobs::Record {
+            run_id: 42,
+            index: 7,
+            ..Default::default()
+        }));
+        project
+            .store(222, &super::Event::Exchange(execution.clone()))
+            .unwrap();
+        let reply = project
+            .apply(super::Command::FindResult {
+                run_id: 42,
+                index: 7,
+            })
+            .unwrap();
+        let super::Reply::Detail { id, event } = reply else {
+            panic!()
+        };
+        assert_eq!(id, 222);
+        let super::Event::Exchange(found) = *event else {
+            panic!()
+        };
+        assert_eq!(found.outgoing, execution.outgoing);
+        assert_eq!(found.response, execution.response);
+        assert!(
+            project
+                .apply(super::Command::FindResult {
+                    run_id: 42,
+                    index: 8
+                })
+                .is_err()
+        );
+    }
     #[test]
     fn temporary_projects_refuse_existing_directories_and_symlinks() {
         let project =

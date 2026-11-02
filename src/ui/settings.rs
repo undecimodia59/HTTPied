@@ -133,6 +133,9 @@ impl Spike {
                         .suffix(" px"),
                 );
                 ui.end_row();
+                ui.label("Message editors");
+                ui.checkbox(&mut settings.wrap_lines, "Wrap long lines by default");
+                ui.end_row();
                 ui.label("Size units");
                 ui.checkbox(&mut settings.binary_units, "Binary (KiB, MiB)");
                 ui.end_row();

@@ -18,11 +18,10 @@ Choose **Open project**, **Create project**, or **Temporary session** on the sta
 Temporary projects are deleted on orderly exit. Chromium/Chrome is installed separately;
 **Open browser** launches it with an isolated profile and HTTPied's proxy settings.
 
-The workspace has **Intercept, History, Replay, Intruder, Compare, Settings and Coder** tabs.
+The workspace has **Intercept, History, Replay, Intruder, Compare, Coder and Settings** tabs.
 Scope, Variables, Browser and Files & storage are grouped under Settings. Intruder results appear
 below its request/response editors. Use **Settings → Variables** for key/value pairs and
-write `{{key}}` in Replay's destination or request. See the
-[workflow guide](docs/WORKFLOW.md) for the full controls and limits.
+write `{{key}}` in Replay's destination or request.
 
 For a CTF: capture traffic in **History**, select a request and press **Ctrl+R** to edit it
 in Replay, then **Ctrl+Enter** to send. History shows executed requests and responses together.
@@ -45,7 +44,7 @@ Raw/Hex retain original bytes. Protocol shows HTTP/2; enable Stream ID to inspec
 Application errors and warnings appear under **Logs** at the bottom of the window, with search,
 severity filters and repeat counts. History contains captured traffic, including HTTP 4xx/5xx.
 
-For a verbose diagnostic build, see [debug logging](docs/DEBUGGING.md). The separate
+Build both executables with `cargo build --locked --release --all-features`. The separate
 `httpied-debug` executable records DNS/TCP/TLS/HTTP2 phases and dependency traces to files.
 
 HTTPS interception is always enabled in the desktop app. Opening a project automatically
@@ -97,17 +96,10 @@ Use `bash scripts/package-linux.sh` or `./scripts/package-windows.ps1` to create
 local archive and checksum in `dist/`. Packages are unsigned; Windows runtime and
 Wayland interaction still require platform testing.
 
-[Implementation and verification](docs/IMPLEMENTATION.md) maps the requested feature
-numbers to delivered behavior. [Change report](docs/CHANGE_REPORT.md) records measurements
-and remaining protocol limits. The broader [feature plan](docs/FEATURE_PLAN.md) remains
-the reference for later extensions.
+Settings is the last workspace tab. Enable **Settings → Appearance → Wrap long lines by default**
+to wrap all message editors; individual panes also have a Wrap control/context-menu option.
+Right-click a request editor to send its full request to Replay or Intruder, preserving its destination.
+Click anywhere on an Intruder result row to inspect that payload's captured request and response;
+**Attack template** returns to the original template. Failed attempts show their recorded error.
 
-
-The [2026-11-02 review](docs/REVIEW_2026-11-02.md) records usability fixes and export privacy
-changes. History now offers visible Replay/Intruder transfers, saved-row context actions,
-and matching page counts. Replay response Find supports Next match and Enter. Redacted
-exports also mask URL queries and common API-key headers; redacted cURL masks secret variables.
-
-The [workspace UX redesign](docs/UX_REDESIGN.md) documents the review of every tab, source
-references, removed duplicate controls, validation and screenshots. Recovery commit `eb170e0`
-preserves the workspace before this redesign.
+Documentation and screenshot directories are local ignored artifacts and are not included in packages.

@@ -34,6 +34,7 @@ pub struct Settings {
     pub browser: String,
     pub browser_url: String,
     pub font_size: f32,
+    pub wrap_lines: bool,
     pub binary_units: bool,
     pub enforce_scope: bool,
     pub concurrency: usize,
@@ -60,6 +61,7 @@ impl Default for Settings {
             browser: String::new(),
             browser_url: "about:blank".into(),
             font_size: 13.0,
+            wrap_lines: false,
             binary_units: false,
             enforce_scope: false,
             concurrency: 1,
@@ -524,6 +526,18 @@ pub fn protocol_parts(protocol: &str) -> (&str, Option<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapping_defaults_for_older_projects_and_survives_persistence() {
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.wrap_lines);
+        let settings = Settings {
+            wrap_lines: true,
+            ..old
+        };
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.wrap_lines);
+    }
     #[test]
     fn destination_columns_preserve_path_query_and_host_boundaries() {
         assert_eq!(

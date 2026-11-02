@@ -7,9 +7,8 @@ try {
     $stage = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString())
     try {
         $package = Join-Path $stage $packageName
-        New-Item -ItemType Directory -Force -Path @((Join-Path $package 'docs'), 'dist') | Out-Null
+        New-Item -ItemType Directory -Force -Path @($package, 'dist') | Out-Null
         Copy-Item 'target/release/httpied.exe', 'README.md' $package
-        Copy-Item 'docs/WORKFLOW.md', 'docs/IMPLEMENTATION.md', 'docs/CHANGE_REPORT.md', 'docs/UI_TESTING.md', 'docs/FEATURE_PLAN.md', 'docs/DEBUGGING.md', 'docs/INVESTIGATION_DNS.md', 'docs/INVESTIGATION_HEADERS.md' (Join-Path $package 'docs')
         New-Item -ItemType Directory -Force -Path (Join-Path $package '.github/workflows') | Out-Null
         Copy-Item '.github/workflows/check.yml' (Join-Path $package '.github/workflows')
         $archive = Join-Path 'dist' "$packageName.zip"

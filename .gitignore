@@ -5,3 +5,7 @@ __pycache__/
 
 /dist/
 /httpied-debug-logs/
+
+/docs/
+/screenshots/
+**/screenshots/

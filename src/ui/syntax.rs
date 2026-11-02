@@ -1,5 +1,54 @@
 //! Display-only highlighting. Layout text is always identical to the supplied editor text.
 use eframe::egui::{self, Color32, FontId, TextFormat, text::LayoutJob};
+#[derive(Clone)]
+pub(super) struct RequestSource {
+    pub destination: String,
+    pub request: String,
+}
+pub(super) fn register_request(
+    ui: &egui::Ui,
+    id: egui::Id,
+    source: Option<Result<RequestSource, String>>,
+) {
+    ui.ctx().data_mut(|data| {
+        data.remove::<Result<RequestSource, String>>(id.with("request-source"));
+        if let Some(source) = source {
+            data.insert_temp(id.with("request-source"), source);
+        }
+    });
+}
+pub(super) fn set_default_wrap(ctx: &egui::Context, value: bool) {
+    ctx.data_mut(|data| {
+        let key = egui::Id::new("editor-wrap-default");
+        let old = data.get_temp::<bool>(key);
+        if old != Some(value) {
+            let generation = data.get_temp::<u64>(key.with("generation")).unwrap_or(0) + 1;
+            data.insert_temp(key.with("generation"), generation);
+        }
+        data.insert_temp(key, value);
+    });
+}
+fn wrapping(ui: &egui::Ui, id: egui::Id) -> bool {
+    ui.ctx().data(|data| {
+        let key = egui::Id::new("editor-wrap-default");
+        let generation = data.get_temp::<u64>(key.with("generation")).unwrap_or(0);
+        data.get_temp::<(u64, bool)>(id.with("wrap"))
+            .filter(|(version, _)| *version == generation)
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| data.get_temp::<bool>(key).unwrap_or(false))
+    })
+}
+pub(super) fn wrap_control(ui: &mut egui::Ui, id: egui::Id) {
+    let mut wrap = wrapping(ui, id);
+    if ui.checkbox(&mut wrap, "Wrap").changed() {
+        ui.ctx().data_mut(|data| {
+            let generation = data
+                .get_temp::<u64>(egui::Id::new("editor-wrap-default").with("generation"))
+                .unwrap_or(0);
+            data.insert_temp(id.with("wrap"), (generation, wrap));
+        });
+    }
+}
 const TEXT: Color32 = Color32::from_rgb(220, 220, 220);
 const KEY: Color32 = Color32::from_rgb(133, 185, 235);
 const VALUE: Color32 = Color32::from_rgb(213, 176, 128);
@@ -154,6 +203,7 @@ pub(super) fn editor_limited(
     limit: usize,
 ) -> egui::Response {
     let selection_before = selected_text(ui.ctx(), id, text);
+    let wrap = wrapping(ui, id);
     // egui's built-in undo compares cursor positions as well as text. Keeping text-only
     // revisions preserves redo when the operator clicks or sends between undo and redo.
     let history = editable.then(|| {
@@ -202,7 +252,7 @@ pub(super) fn editor_limited(
     let diff_colors = ui
         .ctx()
         .data(|data| data.get_temp::<Vec<Color32>>(id.with("diff-colors")));
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _width: f32| {
+    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, width: f32| {
         let mut job = if let Some(colors) = &diff_colors {
             let mut job = LayoutJob::default();
             job.wrap.max_width = f32::INFINITY;
@@ -225,11 +275,12 @@ pub(super) fn editor_limited(
         for section in &mut job.sections {
             section.format.font_id = font.clone();
         }
+        job.wrap.max_width = if wrap { width.max(1.0) } else { f32::INFINITY };
         ui.fonts_mut(|fonts| fonts.layout_job(job))
     };
     let response = ui
         .horizontal_top(|ui| {
-            if diff_colors.is_none() {
+            if diff_colors.is_none() && !wrap {
                 let count = text.lines().count().clamp(1, 5000);
                 let numbers = (1..=count)
                     .map(|n| n.to_string())
@@ -326,6 +377,26 @@ fn selection_menu(
             .data_mut(|data| data.insert_temp(snapshot, selection));
     }
     response.context_menu(|ui| {
+        if let Some(source) = ui
+            .ctx()
+            .data(|data| data.get_temp::<Result<RequestSource, String>>(id.with("request-source")))
+        {
+            for (label, intruder) in [
+                ("Send request to Replay", false),
+                ("Send request to Intruder", true),
+            ] {
+                if ui.button(label).clicked() {
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("request-transfer"),
+                            (intruder, source.clone()),
+                        )
+                    });
+                    ui.close();
+                }
+            }
+            ui.separator();
+        }
         let selected = ui
             .ctx()
             .data(|data| data.get_temp::<String>(snapshot))
@@ -361,6 +432,8 @@ fn selection_menu(
                 ui.close();
             }
         }
+        ui.separator();
+        wrap_control(ui, id);
     });
 }
 pub(super) fn take_coder_selection(ctx: &egui::Context) -> Option<String> {
@@ -383,6 +456,43 @@ pub fn forget_editor(ctx: &egui::Context, id: egui::Id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapping_reflows_long_lines_without_changing_message_bytes() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("wrap-regression");
+        let mut text = format!("X-Token: {}", "Київabc".repeat(60));
+        let original = text.clone();
+        let mut sizes = Vec::new();
+        for wrap in [false, true] {
+            set_default_wrap(&ctx, wrap);
+            let mut rect = egui::Rect::NOTHING;
+            for _ in 0..2 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(360.0, 400.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        egui::ScrollArea::both().show(ui, |ui| {
+                            rect = editor(ui, id, &mut text, true, 1).rect;
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            sizes.push(rect.size());
+        }
+        assert!(sizes[1].y > sizes[0].y);
+        assert!(
+            sizes[1].x <= 360.0,
+            "wrapped editor is still wider than its viewport: {:?}",
+            sizes[1]
+        );
+        assert_eq!(text, original);
+    }
     #[test]
     fn right_click_preserves_unicode_selection_for_editable_and_readonly_menus() {
         for editable in [true, false] {

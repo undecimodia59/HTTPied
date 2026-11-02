@@ -448,39 +448,46 @@ impl Workflow {
         }
         match replay::origin_draft(bytes) {
             Ok((destination, request)) => {
-                if self
-                    .active
-                    .as_ref()
-                    .is_some_and(|(_, active, _)| *active == tab)
-                {
-                    self.message =
-                        "Wait for the active run or cancel it before replacing its request.".into();
-                    return;
-                }
-                if tab == Tab::Replay {
-                    if self.replays.len() >= 8 {
-                        self.message =
-                            "Replay has 8 sessions. Close one before sending another request."
-                                .into();
-                        return;
-                    }
-                    self.replays.push(Tool::new());
-                    self.selected_replay = self.replays.len() - 1;
-                }
-                let tool = if tab == Tab::Replay {
-                    &mut self.replays[self.selected_replay]
-                } else {
-                    &mut self.intruder
-                };
-                tool.destination = destination;
-                tool.request = request;
-                tool.clear_response();
-                tool.status = "Loaded from History".into();
-                self.tab = tab;
-                self.message.clear();
+                self.load_draft(destination, request, tab);
             }
             Err(error) => self.message = error.to_string(),
         }
+    }
+    pub(super) fn load_draft(&mut self, destination: String, request: String, tab: Tab) {
+        if request.len() > 128 * 1024 || destination.len() > 2048 {
+            self.message =
+                "Request exceeds the editor limit; it was not truncated or loaded.".into();
+            return;
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|(_, active, _)| *active == tab)
+        {
+            self.message =
+                "Wait for the active run or cancel it before replacing its request.".into();
+            return;
+        }
+        if tab == Tab::Replay {
+            if self.replays.len() >= 8 {
+                self.message =
+                    "Replay has 8 sessions. Close one before sending another request.".into();
+                return;
+            }
+            self.replays.push(Tool::new());
+            self.selected_replay = self.replays.len() - 1;
+        }
+        let tool = if tab == Tab::Replay {
+            &mut self.replays[self.selected_replay]
+        } else {
+            &mut self.intruder
+        };
+        tool.destination = destination;
+        tool.request = request;
+        tool.clear_response();
+        tool.status = "Request loaded".into();
+        self.tab = tab;
+        self.message.clear();
     }
     pub(super) fn load_execution(&mut self, execution: &crate::model::WireExecution, tab: Tab) {
         match replay::executed_request(execution) {
@@ -732,6 +739,21 @@ impl Workflow {
                 egui::ScrollArea::both()
                     .max_height((ui.available_height() - 100.0).max(180.0))
                     .show(ui, |ui| {
+                        let id = egui::Id::new(("held", held.pending.id));
+                        syntax::register_request(
+                            ui,
+                            id,
+                            (!held.pending.response).then(|| {
+                                if !held.editable || held.pending.request.len() > 128 * 1024 {
+                                    Err("This request cannot be loaded losslessly into the text editor".into())
+                                } else {
+                                    Ok(syntax::RequestSource {
+                                        destination: held.pending.destination.clone(),
+                                        request: held.text.clone(),
+                                    })
+                                }
+                            }),
+                        );
                         syntax::editor(
                             ui,
                             egui::Id::new(("held", held.pending.id)),
@@ -1230,12 +1252,21 @@ impl Workflow {
                 ui.horizontal(|ui| {
                     ui.set_min_height(27.0);
                     ui.strong("Request");
+                    syntax::wrap_control(ui, egui::Id::new(("request", tool.editor_id)));
                 });
                 egui::ScrollArea::both()
                     .id_salt(("tool-request", tool.editor_id))
                     .max_height(height)
                     .min_scrolled_height(height)
                     .show(ui, |ui| {
+                        syntax::register_request(
+                            ui,
+                            egui::Id::new(("request", tool.editor_id)),
+                            Some(Ok(syntax::RequestSource {
+                                destination: tool.destination.clone(),
+                                request: tool.request.clone(),
+                            })),
+                        );
                         syntax::editor(
                             ui,
                             egui::Id::new(("request", tool.editor_id)),
@@ -1252,6 +1283,7 @@ impl Workflow {
                 let mut response_jump = None;
                 ui.horizontal_wrapped(|ui| {
                     ui.strong("Response");
+                    syntax::wrap_control(ui, egui::Id::new(("response", tool.editor_id)));
                     let previous = tool.response_mode;
                     egui::ComboBox::from_id_salt(("response-mode", tool.editor_id))
                         .selected_text(match tool.response_mode {
@@ -1455,8 +1487,8 @@ impl Spike {
                 (Tab::Replay, "Replay".into()),
                 (Tab::Intruder, "Intruder".into()),
                 (Tab::Compare, "Compare".into()),
-                (Tab::Settings, "Settings".into()),
                 (Tab::Coder, "Coder".into()),
+                (Tab::Settings, "Settings".into()),
             ] {
                 if ui
                     .add_sized(
@@ -1489,7 +1521,11 @@ impl Spike {
                     })
                     .max_size((height * 0.55).max(150.0))
                     .show(ui, |ui| self.results_view(ui));
-                self.workflow.tool(ui, Tab::Intruder);
+                if self.features.result_inspection.is_some() {
+                    self.result_inspector(ui);
+                } else {
+                    self.workflow.tool(ui, Tab::Intruder);
+                }
                 self.features.state.settings.request_ratio = self.workflow.settings.request_ratio;
             }
             _ => self.feature_tab(ui),
@@ -1500,6 +1536,23 @@ impl Spike {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn editor_transfers_preserve_destinations_variables_and_payload_templates() {
+        let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());
+        let destination = "https://{{host}}:8443";
+        let request = "POST /{{payload}} HTTP/1.1\r\nX-Test: one\r\nX-Test: two\r\n\r\n{{token}}\n";
+        workflow.load_draft(destination.into(), request.into(), Tab::Intruder);
+        assert_eq!(workflow.intruder.request, request);
+        workflow.load_draft(
+            workflow.intruder.destination.clone(),
+            workflow.intruder.request.clone(),
+            Tab::Replay,
+        );
+        let selected = &workflow.replays[workflow.selected_replay];
+        assert_eq!(selected.destination, destination);
+        assert_eq!(selected.request, request);
+        assert_eq!(workflow.intruder.request, request);
+    }
     #[test]
     fn failed_replay_cannot_redisplay_a_previous_response_when_switching_views() {
         let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());

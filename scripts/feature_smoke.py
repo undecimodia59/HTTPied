@@ -224,7 +224,7 @@ def main():
                         for _ in range(8):key("Right",1);key("Right",0)
                         key("Shift_L",0);lib.XFlush(display);time.sleep(.2)
                         click(110,235,3);shot("glow-selection-menu.png")
-                        click(210,255);time.sleep(.3);shot("glow-coder-selected.png")
+                        click(210,334);time.sleep(.3);shot("glow-coder-selected.png")
                         click(180,300);hotkey("a");hotkey("c")
                         selected=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
                         assert selected=="SGVsbG8=",selected
@@ -279,6 +279,40 @@ def main():
                         shot("glow-intruder-ready.png");click(860,104)
                         for value in ("0000","0001","0002"):wait_path(f"/number/{value}")
                         time.sleep(.5);shot("glow-intruder-results.png")
+                        # Select by payload cell, inspect its exact capture, then transfer it.
+                        click(200,764);time.sleep(.7);shot("followup-intruder-inspection.png")
+                        click(180,400);hotkey("a");hotkey("c")
+                        inspected=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert "GET /number/0001 HTTP/1.1" in inspected,inspected
+                        click(800,400);hotkey("a");hotkey("c")
+                        inspected_response=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert "/number/0001" in inspected_response,inspected_response
+                        click(180,400,3);click(220,420);time.sleep(.4)
+                        hotkey("Return");wait_path("/number/0001")
+                        # Inspecting a result must never overwrite the Intruder attack template.
+                        hotkey("3");click(70,103)
+                        click(180,420);hotkey("a");hotkey("c")
+                        template=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert "{{payload}}" in template,template
+                        # Both directions are available from the editors themselves.
+                        click(180,420,3);click(220,440);time.sleep(.3)
+                        click(180,300);hotkey("a");hotkey("c")
+                        replay_template=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert replay_template==template,(template,replay_template)
+                        click(180,300,3);click(220,352);time.sleep(.3)
+                        click(180,420);hotkey("a");hotkey("c")
+                        returned=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert returned==template,(template,returned)
+                        # Per-pane wrapping must change only layout; the global default is saved.
+                        hotkey("2");click(45,104)
+                        paste(180,300,f"GET {{{{route}}}} HTTP/1.1\r\nHost: {origin}\r\nX-Wrap: {'abc' * 300}\r\n\r\n")
+                        hotkey("a");hotkey("c")
+                        before_wrap=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        click(75,203);shot("followup-replay-wrapped.png")
+                        click(180,300);hotkey("a");hotkey("c")
+                        after_wrap=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert after_wrap==before_wrap,(before_wrap,after_wrap)
+                        hotkey("comma");click(70,531);click(365,178);shot("followup-settings-wrap.png")
                         # History's MIME search must show saved captures and transfer their executed request.
                         hotkey("1");paste(180,101,"javascript");time.sleep(.8);shot("glow-history-mime.png")
                         click(180,177);hotkey("r");time.sleep(.6);shot("glow-history-to-replay.png")
@@ -300,7 +334,7 @@ def main():
                         lib.XResizeWindow(display,window,940,700);lib.XFlush(display);time.sleep(.4)
                         for shortcut,name in [("1","history"),("2","replay"),("3","intruder"),("4","intercept"),("5","coder"),("6","compare"),("comma","settings")]:
                             hotkey(shortcut);shot(f"glow-compact-{name}.png")
-                        print("PASS: keyboard/mouse selection to Coder, Base64 conversion, paired Compare, Replay Undo/Redo, MIME search, History transfer and compact layouts")
+                        print("PASS: selection to Coder, Compare, Replay Undo/Redo, variables, per-payload inspection, editor transfers, wrapping, MIME search and compact layouts")
 
                 event = XEvent()
                 event.message.type = 33  # ClientMessage
@@ -315,6 +349,7 @@ def main():
                 if not args.capture_only and not args.layout_only:
                     with sqlite3.connect(project_path/"project.sqlite") as database:
                         state=json.loads(database.execute("SELECT json FROM state WHERE id=1").fetchone()[0])
+                        assert state["settings"]["wrap_lines"] is True,state["settings"]
                         assert "{{route}}" in state["replays"][0]["request"],state["replays"]
                         assert state["variables"][0]["key"]=="route" and state["variables"][0]["value"]=="/glow-replay",state["variables"]
                         records=[json.loads(row[0]) for row in database.execute("SELECT json FROM results ORDER BY idx")]
