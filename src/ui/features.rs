@@ -458,6 +458,7 @@ impl Spike {
             self.features.last_snapshot = Instant::now();
             // Replay recovery is debounced, including edits made outside Settings.
             self.features.state.replays = self.workflow.saved_requests();
+            self.workflow.save_group_state(&mut self.features.state);
             let snapshot = serde_json::to_string(&self.features.state).unwrap_or_default();
             if snapshot != self.features.saved {
                 if let Some(policy) = &self.features.policy {
@@ -1439,6 +1440,7 @@ impl Drop for Spike {
     fn drop(&mut self) {
         if self.features.open {
             self.features.state.replays = self.workflow.saved_requests();
+            self.workflow.save_group_state(&mut self.features.state);
             if self.features.state.settings.validate().is_ok() {
                 self.features
                     .pending

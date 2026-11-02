@@ -7,6 +7,9 @@ use crate::{
 };
 use std::{net::SocketAddr, time::Duration};
 
+#[path = "replay_groups.rs"]
+mod replay_groups;
+
 static NEXT_EDITOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 #[derive(Clone, Copy, PartialEq)]
 enum PayloadMode {
@@ -124,6 +127,10 @@ pub(super) struct Workflow {
     pending_rx: mpsc::Receiver<Pending>,
     held: VecDeque<Held>,
     replays: Vec<Tool>,
+    replay_groups: Vec<String>,
+    replay_search: String,
+    new_group: String,
+    replay_selection: std::collections::BTreeSet<u64>,
     selected_replay: usize,
     intruder: Tool,
     payloads: String,
@@ -179,6 +186,10 @@ impl Workflow {
             pending_rx,
             held: VecDeque::new(),
             replays: vec![Tool::new()],
+            replay_groups: vec![],
+            replay_search: String::new(),
+            new_group: String::new(),
+            replay_selection: Default::default(),
             selected_replay: 0,
             intruder: Tool::new(),
             payloads: String::new(),
@@ -223,11 +234,12 @@ impl Workflow {
         self.settings = state.settings.clone();
         self.variables = state.variables.clone();
         self.scope = state.scope.clone();
+        self.replay_groups = state.replay_groups.clone();
         if !state.replays.is_empty() {
             self.replays = state
                 .replays
                 .iter()
-                .take(8)
+                .take(crate::state::MAX_REPLAYS)
                 .map(|saved| {
                     let mut tool = Tool::new();
                     tool.destination = saved.destination.clone();
@@ -240,7 +252,7 @@ impl Workflow {
                     tool
                 })
                 .collect();
-            self.selected_replay = 0;
+            self.selected_replay = state.selected_replay.min(self.replays.len() - 1);
         }
     }
     pub(super) fn mark_saved(&mut self, saved: &[crate::state::SavedRequest]) {
@@ -469,12 +481,14 @@ impl Workflow {
             return;
         }
         if tab == Tab::Replay {
-            if self.replays.len() >= 8 {
+            if self.replays.len() >= crate::state::MAX_REPLAYS {
                 self.message =
-                    "Replay has 8 sessions. Close one before sending another request.".into();
+                    "Replay has 64 requests. Close one before sending another request.".into();
                 return;
             }
-            self.replays.push(Tool::new());
+            let mut tool = Tool::new();
+            tool.group = self.replays[self.selected_replay].group.clone();
+            self.replays.push(tool);
             self.selected_replay = self.replays.len() - 1;
         }
         let tool = if tab == Tab::Replay {
@@ -808,99 +822,7 @@ impl Workflow {
             None
         };
         if tab == Tab::Replay {
-            ui.add_enabled_ui(!active, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for index in 0..self.replays.len() {
-                        let tool = &self.replays[index];
-                        let title = format!(
-                            "{}{}{}",
-                            if tool.group.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{}/", tool.group)
-                            },
-                            if tool.name == "Request" {
-                                format!("Request {}", index + 1)
-                            } else {
-                                tool.name.clone()
-                            },
-                            if tool.request != tool.baseline
-                                || tool.destination != tool.baseline_destination
-                            {
-                                " •"
-                            } else {
-                                ""
-                            }
-                        );
-                        if ui
-                            .selectable_label(index == self.selected_replay, title)
-                            .clicked()
-                        {
-                            self.selected_replay = index;
-                        }
-                    }
-                    if ui
-                        .add_enabled(self.replays.len() < 8, egui::Button::new("+ New"))
-                        .clicked()
-                    {
-                        self.replays.push(Tool::new());
-                        self.selected_replay = self.replays.len() - 1;
-                    }
-                    ui.menu_button("Session", |ui| {
-                        ui.label("Name");
-                        ui.add(
-                            egui::TextEdit::singleline(
-                                &mut self.replays[self.selected_replay].name,
-                            )
-                            .char_limit(64)
-                            .desired_width(180.0),
-                        );
-                        if ui
-                            .add_enabled(
-                                self.replays.len() < 8,
-                                egui::Button::new("Duplicate request"),
-                            )
-                            .clicked()
-                        {
-                            let current = &self.replays[self.selected_replay];
-                            let mut copy = Tool::new();
-                            copy.destination = current.destination.clone();
-                            copy.request = current.request.clone();
-                            copy.name = format!("{} copy", current.name);
-                            copy.group = current.group.clone();
-                            copy.timeout_secs = current.timeout_secs;
-                            self.replays.push(copy);
-                            self.selected_replay = self.replays.len() - 1;
-                            ui.close();
-                        }
-                        for (label, direction) in [("Move left", -1), ("Move right", 1)] {
-                            let next = self.selected_replay.saturating_add_signed(direction);
-                            if ui
-                                .add_enabled(
-                                    next != self.selected_replay && next < self.replays.len(),
-                                    egui::Button::new(label),
-                                )
-                                .clicked()
-                            {
-                                self.replays.swap(self.selected_replay, next);
-                                self.selected_replay = next;
-                                ui.close();
-                            }
-                        }
-                        if ui
-                            .add_enabled(self.replays.len() > 1, egui::Button::new("Close request"))
-                            .clicked()
-                        {
-                            let id = self.replays[self.selected_replay].editor_id;
-                            syntax::forget_editor(ui.ctx(), egui::Id::new(("request", id)));
-                            syntax::forget_editor(ui.ctx(), egui::Id::new(("response", id)));
-                            self.replays.remove(self.selected_replay);
-                            self.selected_replay = self.selected_replay.min(self.replays.len() - 1);
-                            ui.close();
-                        }
-                    });
-                });
-            });
+            ui.add_enabled_ui(!active, |ui| self.replay_sessions(ui));
         }
         let tool = if tab == Tab::Replay {
             &mut self.replays[self.selected_replay]
@@ -1635,20 +1557,20 @@ mod tests {
     #[test]
     fn history_transfer_creates_bounded_independent_replay_sessions() {
         let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());
-        for index in 0..7 {
+        for index in 0..63 {
             workflow.load(
                 format!("GET http://local/{index} HTTP/1.1\r\nHost: local\r\n\r\n").as_bytes(),
                 Tab::Replay,
             );
         }
-        assert_eq!(workflow.replays.len(), 8);
+        assert_eq!(workflow.replays.len(), crate::state::MAX_REPLAYS);
         assert!(workflow.replays[1].request.starts_with("GET /0"));
-        assert!(workflow.replays[7].request.starts_with("GET /6"));
+        assert!(workflow.replays[63].request.starts_with("GET /62"));
         workflow.load(
             b"GET http://local/overflow HTTP/1.1\r\nHost: local\r\n\r\n",
             Tab::Replay,
         );
-        assert_eq!(workflow.replays.len(), 8);
-        assert!(workflow.message.contains("8 sessions"));
+        assert_eq!(workflow.replays.len(), crate::state::MAX_REPLAYS);
+        assert!(workflow.message.contains("64 requests"));
     }
 }

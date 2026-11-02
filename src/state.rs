@@ -361,6 +361,7 @@ pub fn resolve(text: &str, variables: &[Variable]) -> Result<String, String> {
     }
     Ok(out)
 }
+pub const MAX_REPLAYS: usize = 64;
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct SavedRequest {
     #[serde(default)]
@@ -392,6 +393,8 @@ pub struct ProjectState {
     pub presets: Vec<Preset>,
     pub variables: Vec<Variable>,
     pub replays: Vec<SavedRequest>,
+    pub replay_groups: Vec<String>,
+    pub selected_replay: usize,
     pub columns: Vec<String>,
     pub column_widths: BTreeMap<String, f32>,
     pub rules: Vec<RewriteRule>,
@@ -428,12 +431,17 @@ impl ProjectState {
             || self.scope.len() > 256
             || self.rules.len() > 64
             || self.presets.len() > 64
-            || self.replays.len() > 8
+            || self.replays.len() > MAX_REPLAYS
+            || self.replay_groups.len() > 64
+            || self
+                .replay_groups
+                .iter()
+                .any(|group| group.is_empty() || group.len() > 64)
         {
             return Err("Project configuration exceeds supported limits".into());
         }
-        if serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > 4 * 1024 * 1024 {
-            return Err("Project configuration exceeds 4 MiB".into());
+        if serde_json::to_vec(self).map_err(|e| e.to_string())?.len() > 16 * 1024 * 1024 {
+            return Err("Project configuration exceeds 16 MiB".into());
         }
         Ok(())
     }
@@ -477,6 +485,8 @@ impl Default for ProjectState {
             ],
             variables: vec![],
             replays: vec![],
+            replay_groups: vec![],
+            selected_replay: 0,
             columns: [
                 "#", "Method", "Status", "Protocol", "Host", "Endpoint", "Duration", "Size",
             ]
