@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, watch};
+use tracing::Instrument;
 pub enum Requests {
     Raw(std::vec::IntoIter<Vec<u8>>),
     Payload {
@@ -161,6 +162,32 @@ pub struct Record {
     pub error: String,
     pub matched: bool,
 }
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct ResultFilter {
+    pub query: String,
+    pub status: String,
+    pub errors_only: bool,
+    pub matched_only: bool,
+    pub sort_by: usize,
+    pub descending: bool,
+    pub latest_only: bool,
+}
+impl ResultFilter {
+    pub fn matches(&self, record: &Record) -> bool {
+        (!self.errors_only || !record.error.is_empty())
+            && (!self.matched_only || record.matched)
+            && (self.status.is_empty() || record.status.to_string().starts_with(&self.status))
+            && (self.query.is_empty()
+                || format!(
+                    "{} {} {}",
+                    record.payloads.join(" "),
+                    record.status,
+                    record.error
+                )
+                .to_lowercase()
+                .contains(&self.query.to_lowercase()))
+    }
+}
 async fn paused_change(pause: &mut Option<watch::Receiver<bool>>) {
     match pause {
         Some(p) => {
@@ -201,9 +228,18 @@ async fn execute_retry(
             at
         };
         tokio::time::sleep_until(at).await;
+        tracing::debug!(%target,attempt,"job HTTP attempt started");
         let result = proxy::execute(bytes.clone(), &config)
             .await
             .map_err(|e| e.to_string());
+        match &result {
+            Ok(execution) => tracing::debug!(
+                attempt,
+                status = execution.response_status,
+                "job HTTP attempt completed"
+            ),
+            Err(error) => tracing::warn!(attempt,%error,"job HTTP attempt failed"),
+        }
         let retry = retryable
             && attempt < options.retries
             && match &result {
@@ -408,17 +444,21 @@ pub async fn run(
                 let cfg = config.clone();
                 let options = job.options.clone();
                 let gate = gate.clone();
-                tasks.spawn(async move {
-                    let started = Instant::now();
-                    let (result, payloads) = match request {
-                        Ok((bytes, payloads)) => (
-                            execute_retry(bytes, cfg, options, gate, pace).await,
-                            payloads,
-                        ),
-                        Err(e) => (Err(e.to_string()), vec![]),
-                    };
-                    (index, started.elapsed(), result, payloads)
-                });
+                let span = tracing::info_span!("job_request", run_id = job.id, index);
+                tasks.spawn(
+                    async move {
+                        let started = Instant::now();
+                        let (result, payloads) = match request {
+                            Ok((bytes, payloads)) => (
+                                execute_retry(bytes, cfg, options, gate, pace).await,
+                                payloads,
+                            ),
+                            Err(e) => (Err(e.to_string()), vec![]),
+                        };
+                        (index, started.elapsed(), result, payloads)
+                    }
+                    .instrument(span),
+                );
                 dispatched += 1;
                 next = tokio::time::Instant::now() + pace;
                 continue;

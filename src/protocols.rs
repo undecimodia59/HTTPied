@@ -9,6 +9,7 @@ use std::{
     task::{Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tracing::Instrument;
 static CONNECTION: AtomicU64 = AtomicU64::new(1);
 fn error(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
@@ -200,12 +201,17 @@ pub(crate) async fn websocket(
         let message = tokio::select! {
             message=downstream.next()=>{direction="client → server";message},
             message=origin.next()=>{direction="server → client";message},
-            _=tokio::time::sleep(cfg.tunnel_idle_timeout)=>return Err(error("WebSocket idle timeout")),
+            _=tokio::time::sleep(cfg.tunnel_idle_timeout)=>return Err(error(format!("WebSocket {} connection {connection}: idle timeout", parsed.target))),
         };
         let Some(message) = message else {
             break;
         };
-        let message = message.map_err(error)?;
+        let message = message.map_err(|e| {
+            error(format!(
+                "WebSocket {} connection {connection}, {direction} receive: {e}",
+                parsed.target
+            ))
+        })?;
         publish(
             cfg,
             ws_event(connection, &parsed.target, direction, &message),
@@ -216,14 +222,34 @@ pub(crate) async fn websocket(
         if direction == "client → server" {
             tokio::time::timeout(cfg.idle_timeout, origin.send(message))
                 .await
-                .map_err(error)?
-                .map_err(error)?;
+                .map_err(|e| {
+                    error(format!(
+                        "WebSocket {} connection {connection}, send to server timeout: {e}",
+                        parsed.target
+                    ))
+                })?
+                .map_err(|e| {
+                    error(format!(
+                        "WebSocket {} connection {connection}, send to server: {e}",
+                        parsed.target
+                    ))
+                })?;
             let _ = downstream.flush().await;
         } else {
             tokio::time::timeout(cfg.idle_timeout, downstream.send(message))
                 .await
-                .map_err(error)?
-                .map_err(error)?;
+                .map_err(|e| {
+                    error(format!(
+                        "WebSocket {} connection {connection}, send to client timeout: {e}",
+                        parsed.target
+                    ))
+                })?
+                .map_err(|e| {
+                    error(format!(
+                        "WebSocket {} connection {connection}, send to client: {e}",
+                        parsed.target
+                    ))
+                })?;
             let _ = origin.flush().await;
         }
         if closed {
@@ -248,6 +274,7 @@ pub async fn h2<T: crate::Transport>(
     cfg: Config,
     first: Option<Box<dyn crate::Transport>>,
 ) -> io::Result<()> {
+    tracing::debug!(%authority,preconnected=first.is_some(),"downstream HTTP/2 handshake started");
     let mut connection = h2::server::Builder::new()
         .max_concurrent_streams(16)
         .initial_window_size(64 * 1024)
@@ -255,18 +282,22 @@ pub async fn h2<T: crate::Transport>(
         .handshake(io)
         .await
         .map_err(error)?;
+    tracing::debug!(%authority,"downstream HTTP/2 handshake completed");
     let first = std::sync::Arc::new(tokio::sync::Mutex::new(first));
     let mut tasks = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
             stream=connection.accept()=>match stream{
                 Some(Ok((request,mut respond)))=>{
-                    if tasks.len()>=16{respond.send_reset(h2::Reason::REFUSED_STREAM);continue;}
+                    if tasks.len()>=16{tracing::warn!(%authority,"HTTP/2 concurrent stream limit reached; resetting stream");respond.send_reset(h2::Reason::REFUSED_STREAM);continue;}
+                    let span=tracing::info_span!("h2_stream",stream_id=request.body().stream_id().as_u32(),method=%request.method(),uri=%request.uri(),%authority);
                     let cfg=cfg.clone();let authority=authority.clone();let first=first.clone();
                     tasks.spawn(async move{
+                        let started=std::time::Instant::now();
+                        tracing::debug!("HTTP/2 stream execution started");
                         let result=h2_stream(request,&mut respond,&authority,&cfg,first).await;
-                        if let Err(e)=result{respond.send_reset(h2::Reason::INTERNAL_ERROR);let _=publish(&cfg,Event::Error(format!("HTTP/2 {authority}: {e}"))).await;}
-                    });
+                        if let Err(e)=result{tracing::warn!(elapsed_ms=started.elapsed().as_millis(),error_kind=?e.kind(),error_debug=?e,error=%e,"HTTP/2 stream failed; sending INTERNAL_ERROR reset");respond.send_reset(h2::Reason::INTERNAL_ERROR);let _=publish(&cfg,Event::Error(format!("HTTP/2 {authority}: {e}"))).await;}else{tracing::debug!(elapsed_ms=started.elapsed().as_millis(),"HTTP/2 stream execution completed");}
+                    }.instrument(span));
                 },Some(Err(e))=>return Err(error(e)),None=>break,
             },
             result=tasks.join_next(),if !tasks.is_empty()=>{if let Some(Err(e))=result{return Err(error(e));}},
@@ -274,6 +305,7 @@ pub async fn h2<T: crate::Transport>(
         }
     }
     while tasks.join_next().await.is_some() {}
+    tracing::debug!(%authority,"HTTP/2 connection closed; stream tasks joined");
     Ok(())
 }
 async fn h2_stream(
@@ -327,6 +359,9 @@ async fn h2_stream(
         parts.method
     )
     .into_bytes();
+    let cookies = parts.headers.get_all(http::header::COOKIE);
+    let cookie_fields = cookies.iter().count();
+    let mut wrote_cookie = false;
     for (name, value) in &parts.headers {
         if [
             "host",
@@ -337,6 +372,23 @@ async fn h2_stream(
         ]
         .contains(&name.as_str())
         {
+            continue;
+        }
+        // HTTP/2 can split Cookie for compression. HTTP/1 requires those values joined
+        // with semicolon-space (RFC 9113, 8.2.3), preserving cookie names and value order.
+        if name == http::header::COOKIE && cookie_fields > 1 {
+            if wrote_cookie {
+                continue;
+            }
+            wrote_cookie = true;
+            wire.extend_from_slice(b"cookie: ");
+            for (index, value) in cookies.iter().enumerate() {
+                if index > 0 {
+                    wire.extend_from_slice(b"; ");
+                }
+                wire.extend_from_slice(value.as_bytes());
+            }
+            wire.extend_from_slice(b"\r\n");
             continue;
         }
         wire.extend_from_slice(name.as_str().as_bytes());
@@ -350,6 +402,11 @@ async fn h2_stream(
     wire.extend_from_slice(b"\r\n");
     wire.extend_from_slice(&body);
     let upstream = first.lock().await.take();
+    tracing::debug!(
+        preconnected = upstream.is_some(),
+        request_bytes = wire.len(),
+        "HTTP/2 stream selecting upstream transport"
+    );
     let method = parts.method.to_string();
     let (mut sink, source) = tokio::io::duplex(64 * 1024);
     let execute = async {
@@ -362,6 +419,12 @@ async fn h2_stream(
     execution.original.0.clear();
     execution.protocol = format!("HTTP/2 stream {stream_id}");
     execution.transformations.push(format!("HTTP/2 stream {stream_id} decoded and forwarded as HTTP/1.1; original HPACK/frame bytes unavailable"));
+    if cookie_fields > 1 {
+        execution.transformations.push(format!(
+            "{cookie_fields} HTTP/2 Cookie fields joined with '; ' for HTTP/1.1"
+        ));
+        tracing::debug!(cookie_fields, "HTTP/2 Cookie fields joined for HTTP/1.1");
+    }
     publish(cfg, Event::Exchange(execution)).await
 }
 async fn adapter_line<R: tokio::io::AsyncBufRead + Unpin>(
@@ -457,6 +520,11 @@ async fn h2_response(
         let status = parsed
             .code
             .ok_or_else(|| error("Response status missing"))?;
+        tracing::debug!(
+            status,
+            head_bytes = head.len(),
+            "HTTP/2 adapter parsed upstream response head"
+        );
         if status < 200 {
             if status == 101 {
                 return Err(error("HTTP/2 upgrades are unsupported"));

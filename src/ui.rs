@@ -4,7 +4,10 @@ use crate::{
     proxy::{self, Config},
 };
 use eframe::egui;
+mod coder;
 mod features;
+mod log_view;
+mod settings;
 mod syntax;
 mod widgets;
 mod workflow;
@@ -119,7 +122,6 @@ struct Entry {
     id: u64,
     event: Event,
     size: usize,
-    label: String,
     loaded: bool,
 }
 struct History {
@@ -150,7 +152,6 @@ impl History {
             self.evicted += 1;
             return;
         }
-        let label = event_label(&event);
         while self.entries.len() >= self.row_limit || self.bytes + size > self.byte_limit {
             if let Some(entry) = self.entries.pop_front() {
                 self.bytes -= entry.size;
@@ -164,7 +165,6 @@ impl History {
             id,
             event,
             size,
-            label,
             loaded: true,
         });
     }
@@ -274,10 +274,7 @@ fn row_fields(event: &Event) -> (String, String, String, String) {
             (
                 preview(e.parsed.method.as_bytes(), 24),
                 status,
-                preview(
-                    e.parsed.target.trim_start_matches("http://").as_bytes(),
-                    512,
-                ),
+                preview(e.parsed.target.as_bytes(), 512),
                 format!(
                     "{} B{}",
                     e.response_total_bytes,
@@ -317,18 +314,28 @@ fn row_fields(event: &Event) -> (String, String, String, String) {
         Event::Listening(address) => ("LISTEN".into(), "—".into(), address.to_string(), "—".into()),
     }
 }
-fn column_layout(columns: &[String], width: f32) -> Vec<(SortColumn, f32, f32, String)> {
+fn column_layout(
+    columns: &[String],
+    widths: &std::collections::BTreeMap<String, f32>,
+    width: f32,
+) -> Vec<(SortColumn, f32, f32, String)> {
     let mut start = 0.0;
+    let flexible = |name: &str| {
+        matches!(name, "Destination" | "Host" | "Endpoint") && !widths.contains_key(name)
+    };
     let fixed = columns
         .iter()
-        .filter(|c| c.as_str() != "Destination")
-        .map(|c| match c.as_str() {
-            "#" => 58.0,
-            "Method" => 80.0,
-            "MIME" => 170.0,
-            _ => 90.0,
+        .filter(|c| !flexible(c))
+        .map(|c| {
+            widths.get(c).copied().unwrap_or(match c.as_str() {
+                "#" => 58.0,
+                "Method" => 80.0,
+                "MIME" => 170.0,
+                _ => 90.0,
+            })
         })
         .sum::<f32>();
+    let flexible_count = columns.iter().filter(|name| flexible(name)).count().max(1) as f32;
     columns
         .iter()
         .filter_map(|name| {
@@ -337,21 +344,30 @@ fn column_layout(columns: &[String], width: f32) -> Vec<(SortColumn, f32, f32, S
                 "Method" => SortColumn::Method,
                 "Status" => SortColumn::Status,
                 "Destination" => SortColumn::Destination,
+                "Host" => SortColumn::Host,
+                "Endpoint" => SortColumn::Endpoint,
                 "Duration" => SortColumn::Duration,
                 "TTFB" => SortColumn::Ttfb,
                 "Held" => SortColumn::Held,
                 "Size" => SortColumn::Size,
                 "MIME" => SortColumn::Mime,
                 "Protocol" => SortColumn::Protocol,
+                "Stream ID" => SortColumn::Stream,
                 _ => return None,
             };
-            let span = match name.as_str() {
-                "Destination" => (width - fixed).max(120.0),
-                "#" => 58.0,
-                "Method" => 80.0,
-                "MIME" => 170.0,
-                _ => 90.0,
-            };
+            let span = widths
+                .get(name)
+                .copied()
+                .unwrap_or(match name.as_str() {
+                    "Destination" | "Host" | "Endpoint" => {
+                        ((width - fixed) / flexible_count).max(160.0)
+                    }
+                    "#" => 58.0,
+                    "Method" => 80.0,
+                    "MIME" => 170.0,
+                    _ => 90.0,
+                })
+                .clamp(40.0, 2000.0);
             let result = (column, start, span, name.clone());
             start += span;
             Some(result)
@@ -361,11 +377,10 @@ fn column_layout(columns: &[String], width: f32) -> Vec<(SortColumn, f32, f32, S
 fn traffic_row(
     ui: &mut egui::Ui,
     entry: &Entry,
-    columns: &[String],
+    layout: &[(SortColumn, f32, f32, String)],
     binary: bool,
     selected: bool,
 ) -> egui::Response {
-    let layout = column_layout(columns, ui.available_width());
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::click());
     if selected || response.hovered() {
@@ -380,15 +395,18 @@ fn traffic_row(
         );
     }
     let (method, status, destination, _) = row_fields(&entry.event);
+    let (host, endpoint) = event_destination_parts(&entry.event);
     for (column, start, span, _) in layout {
-        let value = match column {
+        let value = match *column {
             SortColumn::Id => entry.id.to_string(),
             SortColumn::Method => method.clone(),
             SortColumn::Status => status.clone(),
             SortColumn::Destination => destination.clone(),
+            SortColumn::Host => host.clone(),
+            SortColumn::Endpoint => endpoint.clone(),
             _ => {
                 if let Event::Exchange(e) = &entry.event {
-                    match column {
+                    match *column {
                         SortColumn::Duration => format!("{:.1} ms", e.elapsed_ms),
                         SortColumn::Ttfb => format!("{:.1} ms", e.first_byte_ms),
                         SortColumn::Held => format!("{:.1} ms", e.held_ms),
@@ -399,15 +417,12 @@ fn traffic_row(
                         ),
                         SortColumn::Mime => e.response_mime.clone(),
                         SortColumn::Protocol => {
-                            if e.protocol.starts_with("HTTP/2") {
-                                format!(
-                                    "h2 / {}",
-                                    e.protocol.split_whitespace().last().unwrap_or("?")
-                                )
-                            } else {
-                                e.protocol.clone()
-                            }
+                            crate::state::protocol_parts(&e.protocol).0.to_owned()
                         }
+                        SortColumn::Stream => crate::state::protocol_parts(&e.protocol)
+                            .1
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "—".into()),
                         _ => String::new(),
                     }
                 } else {
@@ -417,7 +432,7 @@ fn traffic_row(
         };
         let cell = egui::Rect::from_min_size(
             egui::pos2(rect.left() + start, rect.top()),
-            egui::vec2(span, rect.height()),
+            egui::vec2(*span, rect.height()),
         )
         .intersect(rect);
         ui.painter().with_clip_rect(cell).text(
@@ -425,7 +440,7 @@ fn traffic_row(
             egui::Align2::LEFT_CENTER,
             value,
             egui::FontId::monospace(12.0),
-            if column == SortColumn::Method {
+            if *column == SortColumn::Method {
                 ACCENT
             } else {
                 ui.visuals().text_color()
@@ -442,6 +457,16 @@ fn traffic_row(
     });
     response.on_hover_text(destination)
 }
+fn event_destination_parts(event: &Event) -> (String, String) {
+    match event {
+        Event::Exchange(e) => crate::state::destination_parts(&e.parsed.target),
+        Event::WebSocket { target, .. } => crate::state::destination_parts(target),
+        Event::Tunnel { authority, .. } | Event::InterceptedTls { authority, .. } => {
+            crate::state::destination_parts(authority)
+        }
+        _ => Default::default(),
+    }
+}
 #[derive(Clone, Copy, PartialEq)]
 enum Pane {
     Original,
@@ -456,14 +481,18 @@ enum SortColumn {
     Method,
     Status,
     Destination,
+    Host,
+    Endpoint,
     Size,
     Duration,
     Protocol,
+    Stream,
     Ttfb,
     Held,
     Mime,
 }
 struct Spike {
+    coder: coder::Coder,
     workflow: Workflow,
     features: features::Features,
     rx: mpsc::Receiver<Event>,
@@ -478,8 +507,11 @@ struct Spike {
     sort_descending: bool,
     disconnected: bool,
     filter: String,
-    errors_only: bool,
+    logs: crate::activity::Book,
+    log_view: log_view::LogView,
     hex: bool,
+    decoded_notice: bool,
+    preview_note: Option<String>,
     confirm_clear: bool,
     toast: Option<(String, std::time::Instant)>,
     scroll_selection: bool,
@@ -489,6 +521,7 @@ impl Spike {
     fn new(rx: mpsc::Receiver<Event>, listen: std::net::SocketAddr) -> Self {
         Self {
             rx,
+            coder: Default::default(),
             features: features::Features::new(),
             workflow: Workflow::offline(listen),
             history: History::new(RETAINED_BYTES, RETAINED_ROWS),
@@ -502,8 +535,11 @@ impl Spike {
             sort_descending: false,
             disconnected: false,
             filter: String::new(),
-            errors_only: false,
+            logs: Default::default(),
+            log_view: Default::default(),
             hex: false,
+            decoded_notice: false,
+            preview_note: None,
             confirm_clear: false,
             toast: None,
             scroll_selection: false,
@@ -511,8 +547,13 @@ impl Spike {
         }
     }
     fn receive(&mut self, event: Event) {
+        if let Event::Error(message) = event {
+            self.add_log(crate::activity::Level::Error, &message);
+            return;
+        }
         if let Event::Listening(address) = event {
             self.workflow.listen = address;
+            self.workflow.listener_ready = true;
             self.status = format!("Listening on {address}");
             return;
         }
@@ -570,6 +611,8 @@ impl Spike {
         self.refresh();
     }
     fn refresh(&mut self) {
+        self.decoded_notice = false;
+        self.preview_note = None;
         let Some(entry) = self
             .history
             .entries
@@ -599,6 +642,11 @@ impl Spike {
                         .unwrap_or_else(|error| format!("Decoded view unavailable: {error}"))
                 } else if self.hex {
                     hex_preview(bytes)
+                } else if self.features.auto_decode || self.features.pretty {
+                    let view = crate::exchange::auto_preview(bytes);
+                    self.decoded_notice = view.decoded;
+                    self.preview_note = view.note;
+                    view.text
                 } else {
                     preview(bytes, PREVIEW)
                 };
@@ -671,19 +719,13 @@ impl Spike {
         }
     }
     fn visible_ids(&self) -> Vec<u64> {
-        let query = self.filter.to_lowercase();
+        let mut filter = self.features.state.filter.clone();
+        filter.text = self.filter.clone();
         let mut entries: Vec<_> = self
             .history
             .entries
             .iter()
-            .filter(|e| {
-                self.features
-                    .state
-                    .filter
-                    .matches(&e.event, &self.features.state.scope)
-                    && (!self.errors_only || matches!(e.event, Event::Error(_)))
-                    && e.label.to_lowercase().contains(&query)
-            })
+            .filter(|e| filter.matches(&e.event, &self.features.state.scope))
             .collect();
         entries.sort_by(|a, b| {
             let fields = |e: &Entry| row_fields(&e.event);
@@ -708,6 +750,12 @@ impl Spike {
                 SortColumn::Destination => {
                     fields(a).2.to_lowercase().cmp(&fields(b).2.to_lowercase())
                 }
+                SortColumn::Host => event_destination_parts(&a.event)
+                    .0
+                    .cmp(&event_destination_parts(&b.event).0),
+                SortColumn::Endpoint => event_destination_parts(&a.event)
+                    .1
+                    .cmp(&event_destination_parts(&b.event).1),
                 SortColumn::Size => size(a).cmp(&size(b)),
                 SortColumn::Duration | SortColumn::Ttfb | SortColumn::Held => {
                     let time = |entry: &Entry| {
@@ -726,12 +774,22 @@ impl Spike {
                 SortColumn::Protocol => {
                     let protocol = |entry: &Entry| {
                         if let Event::Exchange(e) = &entry.event {
-                            e.protocol.clone()
+                            crate::state::protocol_parts(&e.protocol).0.to_owned()
                         } else {
                             String::new()
                         }
                     };
                     protocol(a).cmp(&protocol(b))
+                }
+                SortColumn::Stream => {
+                    let stream = |entry: &Entry| {
+                        if let Event::Exchange(e) = &entry.event {
+                            crate::state::protocol_parts(&e.protocol).1.unwrap_or(0)
+                        } else {
+                            0
+                        }
+                    };
+                    stream(a).cmp(&stream(b))
                 }
                 SortColumn::Mime => {
                     let mime = |entry: &Entry| {
@@ -773,8 +831,12 @@ impl Spike {
         self.selected = None;
         self.text.clear();
         self.draft.clear();
+        self.preview_note = None;
+        self.decoded_notice = false;
+        self.reset_draft_undo = true;
         self.confirm_clear = false;
         self.features.selection.clear();
+        self.features.pending_transfer = None;
         self.detail = "View cleared; saved traffic remains in the project.".into();
         self.toast = Some(("Session captures cleared".into(), std::time::Instant::now()));
     }
@@ -788,29 +850,6 @@ impl Spike {
     }
     fn workspace(&mut self, ui: &mut egui::Ui) {
         self.history_filters(ui);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut self.features.state.filter.errors_only, "Errors only");
-            if let Some(entry) = self
-                .history
-                .entries
-                .iter()
-                .find(|entry| Some(entry.id) == self.selected)
-                && entry.loaded
-                && let Event::Exchange(execution) = &entry.event
-            {
-                if ui.button("Send to Replay").clicked() {
-                    self.workflow.load_execution(execution, Tab::Replay);
-                }
-                if ui.button("Send to Intruder").clicked() {
-                    self.workflow.load_execution(execution, Tab::Intruder);
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Clear view").clicked() {
-                    self.confirm_clear = !self.history.entries.is_empty();
-                }
-            });
-        });
         if self.disconnected {
             ui.colored_label(
                 ERROR,
@@ -828,12 +867,20 @@ impl Spike {
                 }
             });
         }
-        let search = ui.add_sized(
-            [ui.available_width(), 28.0],
-            egui::TextEdit::singleline(&mut self.filter)
-                .hint_text("Filter method, URL, status or error")
-                .char_limit(512),
-        );
+        let search = ui
+            .horizontal(|ui| {
+                let response = ui.add_sized(
+                    [(ui.available_width() - 100.0).max(200.0), 28.0],
+                    egui::TextEdit::singleline(&mut self.filter)
+                        .hint_text("Search History")
+                        .char_limit(512),
+                );
+                if ui.button("Clear view").clicked() {
+                    self.confirm_clear = !self.history.entries.is_empty();
+                }
+                response
+            })
+            .inner;
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
             search.request_focus();
         }
@@ -854,113 +901,177 @@ impl Spike {
         let mut send_to = None;
         card().show(ui, |ui| {
             let width = ui.available_width();
-            let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
-            for (column, start, span, title) in column_layout(&self.features.state.columns, width) {
-                let cell = egui::Rect::from_min_size(
-                    egui::pos2(rect.left() + start, rect.top()),
-                    egui::vec2(span, 24.0),
-                );
-                let response = ui.interact(
-                    cell,
-                    ui.id().with(("sort", column as u8)),
-                    egui::Sense::click(),
-                );
-                if response.clicked() {
-                    if self.sort_column == column {
-                        self.sort_descending = !self.sort_descending;
-                    } else {
-                        self.sort_column = column;
-                        self.sort_descending = false;
-                    }
-                    self.features.state.filter.sort_by = title.clone();
-                    self.features.state.filter.descending = self.sort_descending;
-                }
-                let label = if self.sort_column == column {
-                    format!("{title} {}", if self.sort_descending { "v" } else { "^" })
-                } else {
-                    title
-                };
-                ui.painter().text(
-                    egui::pos2(cell.left() + 8.0, cell.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    label,
-                    egui::FontId::proportional(12.0),
-                    if response.hovered() { ACCENT } else { MUTED },
-                );
-                response.on_hover_text("Click to sort; click again to reverse");
-            }
-            ui.separator();
-            let ids = self.visible_ids();
-            let height = (ui.available_height() * 0.36).clamp(110.0, 250.0);
-            let mut area = egui::ScrollArea::vertical()
-                .id_salt("history-rows")
-                .min_scrolled_height(height)
-                .max_height(height);
-            if self.scroll_selection {
-                if let Some(index) = ids.iter().position(|id| Some(*id) == self.selected) {
-                    area = area.vertical_scroll_offset(
-                        index as f32 * (28.0 + ui.spacing().item_spacing.y),
-                    );
-                }
-                self.scroll_selection = false;
-            }
-            area.show_rows(ui, 28.0, ids.len(), |ui, range| {
-                for row in range {
-                    let entry = self
-                        .history
-                        .entries
-                        .iter()
-                        .find(|e| e.id == ids[row])
-                        .unwrap();
-                    let response = traffic_row(
-                        ui,
-                        entry,
-                        &self.features.state.columns,
-                        self.features.state.settings.binary_units,
-                        self.selected == Some(entry.id)
-                            || self.features.selection.contains(&entry.id),
-                    );
-                    if response.clicked() {
-                        clicked = Some((entry.id, ui.input(|i| i.modifiers)));
-                    }
-                    response.context_menu(|ui| {
-                        if ui.button("Export selected…").clicked() {
-                            if !self.features.selection.contains(&entry.id) {
-                                self.features.selection.clear();
-                                self.features.selection.insert(entry.id);
+            let layout = column_layout(
+                &self.features.state.columns,
+                &self.features.state.column_widths,
+                width,
+            );
+            let width = layout
+                .last()
+                .map_or(width, |(_, start, span, _)| start + span)
+                .max(width);
+            egui::ScrollArea::horizontal()
+                .id_salt("history-horizontal")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
+                    for (column, start, span, title) in &layout {
+                        let cell = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + start, rect.top()),
+                            egui::vec2(*span, 24.0),
+                        );
+                        let response = ui.interact(
+                            egui::Rect::from_min_max(
+                                cell.min,
+                                egui::pos2(cell.right() - 4.0, cell.bottom()),
+                            ),
+                            ui.id().with(("sort", *column as u8)),
+                            egui::Sense::click(),
+                        );
+                        if response.clicked() {
+                            if self.sort_column == *column {
+                                self.sort_descending = !self.sort_descending;
+                            } else {
+                                self.sort_column = *column;
+                                self.sort_descending = false;
                             }
-                            self.features.export_subset = 2;
-                            self.workflow.tab = Tab::Project;
-                            ui.close();
+                            self.features.state.filter.sort_by = title.clone();
+                            self.features.state.filter.descending = self.sort_descending;
                         }
-                        if entry.loaded
-                            && let Event::Exchange(execution) = &entry.event
-                        {
-                            if ui.button("Send to Replay").clicked() {
-                                send_to =
-                                    Some((crate::replay::executed_request(execution), Tab::Replay));
-                                ui.close();
-                            }
-                            if ui.button("Send to Intruder").clicked() {
-                                send_to = Some((
-                                    crate::replay::executed_request(execution),
-                                    Tab::Intruder,
-                                ));
-                                ui.close();
-                            }
+                        let label = if self.sort_column == *column {
+                            format!("{title} {}", if self.sort_descending { "v" } else { "^" })
                         } else {
-                            ui.label("No HTTP request in this event");
+                            title.clone()
+                        };
+                        ui.painter()
+                            .with_clip_rect(cell.intersect(ui.clip_rect()))
+                            .text(
+                                egui::pos2(cell.left() + 8.0, cell.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                label,
+                                egui::FontId::proportional(12.0),
+                                if response.hovered() { ACCENT } else { MUTED },
+                            );
+                        response.on_hover_text("Click to sort; click again to reverse");
+                        let edge = egui::Rect::from_center_size(
+                            egui::pos2(cell.right() - 2.0, cell.center().y),
+                            egui::vec2(8.0, 24.0),
+                        );
+                        let resize = ui
+                            .interact(
+                                edge,
+                                ui.id().with(("resize-column", title)),
+                                egui::Sense::click_and_drag(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                            .on_hover_text("Drag to resize; double-click for automatic width");
+                        if resize.double_clicked() {
+                            self.features.state.column_widths.remove(title);
+                        } else if resize.dragged() {
+                            self.features.state.column_widths.insert(
+                                title.clone(),
+                                (span + resize.drag_delta().x).clamp(40.0, 2000.0),
+                            );
+                        }
+                        ui.painter().line_segment(
+                            [
+                                egui::pos2(cell.right() - 2.0, cell.top() + 4.0),
+                                egui::pos2(cell.right() - 2.0, cell.bottom() - 4.0),
+                            ],
+                            egui::Stroke::new(
+                                1.0,
+                                if resize.hovered() || resize.dragged() {
+                                    ACCENT
+                                } else {
+                                    ui.visuals().widgets.noninteractive.bg_stroke.color
+                                },
+                            ),
+                        );
+                    }
+                    ui.separator();
+                    let ids = self.visible_ids();
+                    let height = (ui.available_height() * 0.36).clamp(110.0, 250.0);
+                    let mut area = egui::ScrollArea::vertical()
+                        .id_salt("history-rows")
+                        .min_scrolled_height(height)
+                        .max_height(height);
+                    if self.scroll_selection {
+                        if let Some(index) = ids.iter().position(|id| Some(*id) == self.selected) {
+                            area = area.vertical_scroll_offset(
+                                index as f32 * (28.0 + ui.spacing().item_spacing.y),
+                            );
+                        }
+                        self.scroll_selection = false;
+                    }
+                    area.show_rows(ui, 28.0, ids.len(), |ui, range| {
+                        for row in range {
+                            let entry = self
+                                .history
+                                .entries
+                                .iter()
+                                .find(|e| e.id == ids[row])
+                                .unwrap();
+                            let response = traffic_row(
+                                ui,
+                                entry,
+                                &layout,
+                                self.features.state.settings.binary_units,
+                                self.selected == Some(entry.id)
+                                    || self.features.selection.contains(&entry.id),
+                            );
+                            if response.clicked() {
+                                clicked = Some((entry.id, ui.input(|i| i.modifiers)));
+                            }
+                            response.context_menu(|ui| {
+                                if ui.button("Export selected…").clicked() {
+                                    if !self.features.selection.contains(&entry.id) {
+                                        self.features.selection.clear();
+                                        self.features.selection.insert(entry.id);
+                                    }
+                                    self.features.export_subset = 2;
+                                    self.features.settings_section =
+                                        features::SettingsSection::Project;
+                                    self.workflow.tab = Tab::Settings;
+                                    ui.close();
+                                }
+                                if let Event::Exchange(execution) = &entry.event {
+                                    if ui.button("Send to Replay").clicked() {
+                                        send_to = Some((entry.id, Tab::Replay));
+                                        ui.close();
+                                    }
+                                    if ui.button("Send to Intruder").clicked() {
+                                        send_to = Some((entry.id, Tab::Intruder));
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy URL").clicked() {
+                                        ui.ctx().copy_text(execution.parsed.target.clone());
+                                        self.toast =
+                                            Some(("URL copied".into(), std::time::Instant::now()));
+                                        ui.close();
+                                    }
+                                } else {
+                                    ui.label("No HTTP request in this event");
+                                }
+                            });
                         }
                     });
-                }
-            });
-            if ids.is_empty() {
-                ui.label(if self.history.entries.is_empty() {
-                    "No captured requests"
-                } else {
-                    "No matching entries"
+                    if ids.is_empty() {
+                        ui.label(
+                            if self.history.entries.is_empty() && self.features.total == 0 {
+                                "No captured requests"
+                            } else {
+                                "No requests in the current view"
+                            },
+                        );
+                        ui.weak(if self.features.total == 0 {
+                            "Open browser to capture traffic, or configure a client to use the listener above."
+                        } else {
+                            "Try a different search or filter, or Refresh to reload saved captures."
+                        });
+                    }
                 });
-            }
         });
         if let Some((id, modifiers)) = clicked {
             if modifiers.shift {
@@ -985,8 +1096,8 @@ impl Spike {
             }
             self.select(id);
         }
-        if let Some((bytes, tab)) = send_to {
-            self.workflow.load_result(bytes, tab);
+        if let Some((id, tab)) = send_to {
+            self.transfer_history(id, tab);
         }
         muted(
             ui,
@@ -1006,14 +1117,42 @@ impl Spike {
         }
         self.inspector_tools(ui);
         ui.add_space(3.0);
-        ui.horizontal(|ui| {
+        let transferable = self.history.entries.iter().any(|entry| {
+            Some(entry.id) == self.selected && matches!(entry.event, Event::Exchange(_))
+        });
+        let mut transfer = None;
+        ui.horizontal_wrapped(|ui| {
             if let Some(id) = self.selected {
                 muted(ui, format!("Request #{id:04}"));
+                if let Some(Entry {
+                    event: Event::Exchange(execution),
+                    ..
+                }) = self.history.entries.iter().find(|entry| entry.id == id)
+                {
+                    let (protocol, stream) = crate::state::protocol_parts(&execution.protocol);
+                    if let Some(stream) = stream {
+                        muted(ui, format!("{protocol} · Stream ID {stream}"));
+                    }
+                }
                 if !self.visible_ids().contains(&id) {
                     badge(ui, "Selection outside filter", WARN);
                 }
             }
+            for (tab, label) in [
+                (Tab::Replay, "Send to Replay"),
+                (Tab::Intruder, "Send to Intruder"),
+            ] {
+                if ui
+                    .add_enabled(transferable, egui::Button::new(label))
+                    .clicked()
+                {
+                    transfer = self.selected.map(|id| (id, tab));
+                }
+            }
         });
+        if let Some((id, tab)) = transfer {
+            self.transfer_history(id, tab);
+        }
         let previous = (self.pane, self.hex);
         ui.horizontal_wrapped(|ui| {
             for (pane, label) in [
@@ -1026,9 +1165,6 @@ impl Spike {
                 ui.selectable_value(&mut self.pane, pane, label);
             }
             ui.separator();
-            if self.pane != Pane::Draft {
-                ui.checkbox(&mut self.hex, "Hex");
-            }
             if ui
                 .add_enabled(self.selected.is_some(), egui::Button::new("Copy view"))
                 .clicked()
@@ -1043,6 +1179,11 @@ impl Spike {
         });
         if previous != (self.pane, self.hex) {
             self.refresh();
+        }
+        if self.pane != Pane::Draft
+            && let Some(note) = &self.preview_note
+        {
+            muted(ui, note);
         }
         if self.pane == Pane::Draft {
             ui.horizontal_wrapped(|ui| {
@@ -1088,9 +1229,7 @@ impl Spike {
                         self.draft.truncate(end);
                     }
                 } else {
-                    if self.hex {
-                        ui.monospace(&self.text);
-                    } else {
+                    {
                         syntax::editor(
                             ui,
                             egui::Id::new(("history-message", self.pane as u8)),
@@ -1122,6 +1261,7 @@ impl eframe::App for Spike {
                 Ok(event) => self.receive(event),
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     self.disconnected = true;
+                    self.workflow.listener_ready = false;
                     break;
                 }
                 Err(_) => break,
@@ -1131,7 +1271,10 @@ impl eframe::App for Spike {
             egui::TextStyle::Monospace,
             egui::FontId::monospace(self.features.state.settings.font_size),
         );
+        self.capture_notices();
+        self.log_panels(ui);
         egui::CentralPanel::default().show(ui, |ui| self.content(ui));
+        self.receive_coder_selection(ui.ctx());
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
     }
@@ -1140,6 +1283,62 @@ impl eframe::App for Spike {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn history_search_uses_the_same_mime_and_metadata_match_as_saved_pages() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut app = Spike::new(rx, "127.0.0.1:8080".parse().unwrap());
+        app.receive(exchange());
+        app.features.state.filter.text = "stale query".into();
+        app.filter = "TEXT/PLAIN".into();
+        assert_eq!(app.visible_ids(), vec![1]);
+        app.filter = "not present".into();
+        assert!(app.visible_ids().is_empty());
+        app.filter.clear();
+        assert_eq!(app.visible_ids(), vec![1]);
+    }
+    #[test]
+    fn clearing_history_clears_preview_metadata_and_preserves_saved_count() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut app = Spike::new(rx, "127.0.0.1:8080".parse().unwrap());
+        app.receive(exchange());
+        app.features.total = 42;
+        app.preview_note = Some("Previous response was binary".into());
+        app.decoded_notice = true;
+        app.clear();
+        assert!(app.selected.is_none());
+        assert!(app.text.is_empty() && app.draft.is_empty());
+        assert!(app.preview_note.is_none() && !app.decoded_notice);
+        assert_eq!(app.features.total, 42);
+    }
+    #[test]
+    fn history_auto_decodes_gzip_and_raw_keeps_original_bytes() {
+        use std::io::Write;
+        let (_tx, rx) = mpsc::channel(1);
+        let mut app = Spike::new(rx, "127.0.0.1:8080".parse().unwrap());
+        let Event::Exchange(mut e) = exchange() else {
+            unreachable!()
+        };
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(b"window.fixture = 'readable JS';")
+            .unwrap();
+        e.response = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        e.response.extend(encoder.finish().unwrap());
+        let original = e.response.clone();
+        app.receive(Event::Exchange(e));
+        app.pane = Pane::Response;
+        app.refresh();
+        assert!(app.text.contains("window.fixture = 'readable JS';"));
+        assert!(app.decoded_notice);
+        app.features.auto_decode = false;
+        app.refresh();
+        assert_eq!(app.text, preview(&original, PREVIEW));
+        assert!(!app.decoded_notice);
+        let Event::Exchange(e) = &app.history.entries[0].event else {
+            unreachable!()
+        };
+        assert_eq!(e.response, original);
+    }
     use crate::model::{OriginalCapture, ParsedMessage, WireExecution};
     fn exchange() -> Event {
         Event::Exchange(WireExecution {
@@ -1199,6 +1398,10 @@ mod tests {
         assert_eq!(app.text, original);
         app.history.row_limit = 1;
         app.receive(Event::Error("failure".into()));
+        assert_eq!(app.selected, Some(1));
+        assert_eq!(app.draft, "edited");
+        assert_eq!(app.logs.records.len(), 1);
+        app.receive(exchange());
         assert!(app.selected.is_none());
         assert!(app.draft.is_empty());
     }
@@ -1210,18 +1413,18 @@ mod tests {
         app.receive(Event::Error("Connection refused".into()));
         app.receive(exchange());
         app.filter = "gEt".into();
-        assert_eq!(app.visible_ids(), vec![1, 3]);
+        assert_eq!(app.visible_ids(), vec![1, 2]);
         app.move_selection(1);
-        assert_eq!(app.selected, Some(3));
+        assert_eq!(app.selected, Some(2));
         app.move_selection(1);
-        assert_eq!(app.selected, Some(3));
+        assert_eq!(app.selected, Some(2));
         app.move_selection(-1);
         assert_eq!(app.selected, Some(1));
         app.filter.clear();
-        app.errors_only = true;
-        assert_eq!(app.visible_ids(), vec![2]);
+        assert_eq!(app.visible_ids(), vec![1, 2]);
+        assert_eq!(app.logs.records[0].message, "Connection refused");
         app.filter = "REFUSED".into();
-        assert_eq!(app.visible_ids(), vec![2]);
+        assert!(app.visible_ids().is_empty());
         app.filter = "not found".into();
         app.move_selection(1);
         assert_eq!(app.selected, Some(1));
@@ -1243,17 +1446,13 @@ mod tests {
         theme(&context);
         app.features.open = true;
         for tab in [
-            Tab::Target,
-            Tab::Variables,
             Tab::Settings,
+            Tab::Coder,
             Tab::Compare,
-            Tab::Results,
-            Tab::Project,
             Tab::Intercept,
             Tab::History,
             Tab::Replay,
             Tab::Intruder,
-            Tab::Browser,
         ] {
             app.workflow.tab = tab;
             let input = egui::RawInput {

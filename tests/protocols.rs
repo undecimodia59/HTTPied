@@ -31,3 +31,43 @@ async fn websocket_messages_are_forwarded_and_captured_in_both_directions() {
         let _=ws.close(None).await;stop.send(true).unwrap();serving.await.unwrap().unwrap();fixture.await.unwrap();
     }).await.unwrap();
 }
+
+#[tokio::test]
+async fn abrupt_websocket_close_retains_target_direction_and_failure() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = listener.local_addr().unwrap();
+        let fixture = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let message = ws.next().await.unwrap().unwrap();
+            ws.send(message).await.unwrap();
+            // Drop TCP without a WebSocket Close frame, reproducing the reported log.
+        });
+        let cfg = Config { listen: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+        let listener = proxy::bind(&cfg).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        let (stop, shutdown) = watch::channel(false);
+        let serving = tokio::spawn(proxy::serve(listener, cfg, tx, shutdown));
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let key = tokio_tungstenite::tungstenite::handshake::client::generate_key();
+        client.write_all(format!("GET http://{origin}/abrupt HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").as_bytes()).await.unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") { head.push(client.read_u8().await.unwrap()); }
+        assert!(head.starts_with(b"HTTP/1.1 101"));
+        let mut ws = tokio_tungstenite::WebSocketStream::from_raw_socket(client,tokio_tungstenite::tungstenite::protocol::Role::Client,None).await;
+        ws.send(tokio_tungstenite::tungstenite::Message::Text("hello".into())).await.unwrap();
+        assert_eq!(ws.next().await.unwrap().unwrap().to_text().unwrap(),"hello");
+        loop {
+            if let Event::Error(message) = rx.recv().await.unwrap() {
+                assert!(message.contains(&origin.to_string()) && message.contains("/abrupt"),"{message}");
+                assert!(message.contains("server → client receive") && message.contains("without closing handshake"),"{message}");
+                break;
+            }
+        }
+        stop.send(true).unwrap();
+        serving.await.unwrap().unwrap();
+        fixture.await.unwrap();
+    }).await.unwrap();
+}

@@ -22,13 +22,9 @@ pub(super) enum Tab {
     History,
     Replay,
     Intruder,
-    Browser,
-    Target,
     Settings,
-    Variables,
     Compare,
-    Project,
-    Results,
+    Coder,
 }
 struct Held {
     pending: Pending,
@@ -47,6 +43,8 @@ pub(super) struct Tool {
     response_bytes: Vec<u8>,
     response_mode: u8,
     response_find: String,
+    response_search_next: usize,
+    response_note: Option<String>,
     last_target: String,
     response: String,
     status: String,
@@ -54,14 +52,44 @@ pub(super) struct Tool {
     repair: bool,
 }
 impl Tool {
-    fn response_view(&self) -> String {
+    fn curl(&self, variables: &[crate::state::Variable], redact: bool) -> Result<String, String> {
+        let mut variables = variables.to_vec();
+        if redact {
+            for variable in &mut variables {
+                if variable.secret {
+                    variable.value = "[REDACTED]".into();
+                }
+            }
+        }
+        let destination = crate::state::resolve(&self.destination, &variables)?;
+        let request = crate::state::resolve(&self.request, &variables)?;
+        crate::interchange::curl(&destination, &request, redact)
+    }
+    fn clear_response(&mut self) {
+        self.response_bytes.clear();
+        self.response.clear();
+        self.response_note = None;
+        self.last_target.clear();
+        self.response_search_next = 0;
+    }
+    fn response_view(&mut self) -> String {
+        self.response_note = None;
+        if self.response_bytes.is_empty() {
+            return String::new();
+        }
         match self.response_mode {
-            1 => crate::exchange::pretty(&preview(&self.response_bytes, PREVIEW)),
+            1 => crate::exchange::pretty(&self.automatic_response()),
             2 => hex_preview(&self.response_bytes),
             3 => crate::exchange::decoded(&self.response_bytes)
                 .unwrap_or_else(|e| format!("Decoded view unavailable: {e}")),
+            4 => self.automatic_response(),
             _ => preview(&self.response_bytes, PREVIEW),
         }
+    }
+    fn automatic_response(&mut self) -> String {
+        let view = crate::exchange::auto_preview(&self.response_bytes);
+        self.response_note = view.note;
+        view.text
     }
     fn new() -> Self {
         Self {
@@ -71,8 +99,10 @@ impl Tool {
             group: String::new(),
             timeout_secs: 0,
             response_bytes: Vec::new(),
-            response_mode: 0,
+            response_mode: 4,
             response_find: String::new(),
+            response_search_next: 0,
+            response_note: None,
             last_target: String::new(),
             destination: String::new(),
             request: "GET / HTTP/1.1\r\n\r\n".into(),
@@ -85,6 +115,8 @@ impl Tool {
 }
 pub(super) struct Workflow {
     pub tab: Tab,
+    pub trust_ready: bool,
+    pub listener_ready: bool,
     pub variables: Vec<crate::state::Variable>,
     pub scope: Vec<crate::state::ScopeRule>,
     pub settings: crate::state::Settings,
@@ -126,7 +158,7 @@ pub(super) struct Workflow {
     browser_rx: Option<std::sync::mpsc::Receiver<String>>,
     browser_status: String,
     pub listen: SocketAddr,
-    message: String,
+    pub(super) message: String,
 }
 impl Workflow {
     pub fn new(
@@ -138,6 +170,8 @@ impl Workflow {
     ) -> Self {
         Self {
             tab: Tab::Intercept,
+            trust_ready: false,
+            listener_ready: false,
             variables: Vec::new(),
             scope: Vec::new(),
             settings: Default::default(),
@@ -271,6 +305,10 @@ impl Workflow {
         }
         if let Some(rx) = &self.browser_rx {
             while let Ok(message) = rx.try_recv() {
+                if message.to_lowercase().contains("failed") || message.contains("already running")
+                {
+                    self.message = message.clone();
+                }
                 self.browser_status = message;
             }
         }
@@ -361,10 +399,14 @@ impl Workflow {
                     events.push(Event::Exchange(execution));
                     (response, summary)
                 }
-                Err(error) => (
-                    error.clone(),
-                    format!("{}/{}  {error}", result.index + 1, result.total),
-                ),
+                Err(error) => {
+                    tool.clear_response();
+                    events.push(Event::Error(error.clone()));
+                    (
+                        String::new(),
+                        format!("{}/{}  Failed · see Logs", result.index + 1, result.total),
+                    )
+                }
             };
             tool.response = response;
             tool.status = summary;
@@ -375,6 +417,16 @@ impl Workflow {
         events
     }
     fn launch_browser(&mut self) {
+        if !self.listener_ready {
+            self.message = "The proxy listener is not ready. Check the listener status.".into();
+            return;
+        }
+        if !self.trust_ready {
+            self.message =
+                "HTTPS certificate setup is not ready. See Settings / Certificates.".into();
+            return;
+        }
+
         let Some(tx) = &self.browser_tx else {
             self.browser_status = "Browser worker unavailable".into();
             return;
@@ -422,7 +474,7 @@ impl Workflow {
                 };
                 tool.destination = destination;
                 tool.request = request;
-                tool.response.clear();
+                tool.clear_response();
                 tool.status = "Loaded from History".into();
                 self.tab = tab;
                 self.message.clear();
@@ -595,6 +647,7 @@ impl Workflow {
         }) {
             Ok(()) => {
                 self.active = Some((id, tab, cancel));
+                tool.clear_response();
                 tool.status = "Running…".into();
                 self.message.clear();
             }
@@ -715,17 +768,11 @@ impl Workflow {
                 pause.send_replace(!paused);
             }
         }
-        if tab == Tab::Intruder
-            && let Ok(plan) = self.make_plan()
-        {
-            ui.label(format!(
-                "Planned: {} requests to {} · {} ms delay · concurrency {}",
-                plan.len(),
-                self.intruder.destination,
-                self.settings.delay_ms,
-                self.settings.concurrency
-            ));
-        }
+        let planned = if tab == Tab::Intruder {
+            self.make_plan().ok().map(|plan| plan.len())
+        } else {
+            None
+        };
         if tab == Tab::Replay {
             ui.add_enabled_ui(!active, |ui| {
                 ui.horizontal_wrapped(|ui| {
@@ -817,7 +864,7 @@ impl Workflow {
         } else {
             &mut self.intruder
         };
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if tab == Tab::Replay {
                 ui.add(
                     egui::TextEdit::singleline(&mut tool.name)
@@ -830,7 +877,7 @@ impl Workflow {
                 !active,
                 egui::TextEdit::singleline(&mut tool.destination)
                     .hint_text("http://host:port")
-                    .desired_width(340.0)
+                    .desired_width(if tab == Tab::Intruder { 280.0 } else { 340.0 })
                     .char_limit(2048),
             );
             send = ui
@@ -856,66 +903,6 @@ impl Workflow {
         if tab == Tab::Intruder {
             ui.add_enabled_ui(!active, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(
-                        &mut self.attack_mode,
-                        crate::attack::Mode::Sniper,
-                        "Sniper",
-                    );
-                    ui.selectable_value(
-                        &mut self.attack_mode,
-                        crate::attack::Mode::Pitchfork,
-                        "Pitchfork",
-                    );
-                    ui.selectable_value(
-                        &mut self.attack_mode,
-                        crate::attack::Mode::ClusterBomb,
-                        "Cluster bomb",
-                    );
-                    ui.label("Positions");
-                    ui.add(egui::DragValue::new(&mut self.positions).range(1..=4));
-                    ui.selectable_value(&mut self.encoding, crate::attack::Encoding::None, "Raw");
-                    ui.selectable_value(&mut self.encoding, crate::attack::Encoding::Url, "URL");
-                    ui.selectable_value(
-                        &mut self.encoding,
-                        crate::attack::Encoding::Base64,
-                        "Base64",
-                    );
-                });
-                ui.collapsing("Additional sets and transforms", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Prefix");
-                        ui.text_edit_singleline(&mut self.prefix);
-                        ui.label("Suffix");
-                        ui.text_edit_singleline(&mut self.suffix);
-                    });
-                    for slot in 1..self.positions {
-                        ui.label(format!(
-                            "{{{{payload{}}}}} · one per line; empty uses primary set",
-                            slot + 1
-                        ));
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.extra_payloads[slot - 1])
-                                .char_limit(16384)
-                                .desired_rows(2),
-                        );
-                    }
-                    ui.label("Sniper defaults for inactive positions");
-                    for slot in 0..self.positions {
-                        ui.horizontal(|ui| {
-                            ui.label(format!("Position {}", slot + 1));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.defaults[slot])
-                                    .char_limit(4096),
-                            );
-                        });
-                    }
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Response contains");
-                    ui.add(egui::TextEdit::singleline(&mut self.matcher).char_limit(256));
-                    ui.checkbox(&mut self.stop_on_match, "Stop on match");
-                });
-                ui.horizontal(|ui| {
                     ui.label("Payloads");
                     ui.selectable_value(&mut self.payload_mode, PayloadMode::Text, "Text");
                     ui.selectable_value(&mut self.payload_mode, PayloadMode::Numbers, "Numbers");
@@ -930,7 +917,78 @@ impl Workflow {
                         PayloadMode::Random,
                         "Seeded random",
                     );
-                    ui.label("Insertion marker: {{payload}}");
+                    ui.menu_button("Attack options", |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.selectable_value(
+                                &mut self.attack_mode,
+                                crate::attack::Mode::Sniper,
+                                "Sniper",
+                            );
+                            ui.selectable_value(
+                                &mut self.attack_mode,
+                                crate::attack::Mode::Pitchfork,
+                                "Pitchfork",
+                            );
+                            ui.selectable_value(
+                                &mut self.attack_mode,
+                                crate::attack::Mode::ClusterBomb,
+                                "Cluster bomb",
+                            );
+                            ui.label("Positions");
+                            ui.add(egui::DragValue::new(&mut self.positions).range(1..=4));
+                            ui.selectable_value(
+                                &mut self.encoding,
+                                crate::attack::Encoding::None,
+                                "Raw",
+                            );
+                            ui.selectable_value(
+                                &mut self.encoding,
+                                crate::attack::Encoding::Url,
+                                "URL",
+                            );
+                            ui.selectable_value(
+                                &mut self.encoding,
+                                crate::attack::Encoding::Base64,
+                                "Base64",
+                            );
+                        });
+                        ui.collapsing("Additional sets and transforms", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Prefix");
+                                ui.text_edit_singleline(&mut self.prefix);
+                                ui.label("Suffix");
+                                ui.text_edit_singleline(&mut self.suffix);
+                            });
+                            for slot in 1..self.positions {
+                                ui.label(format!(
+                                    "{{{{payload{}}}}} · one per line; empty uses primary set",
+                                    slot + 1
+                                ));
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.extra_payloads[slot - 1])
+                                        .char_limit(16384)
+                                        .desired_rows(2),
+                                );
+                            }
+                            ui.label("Sniper defaults for inactive positions");
+                            for slot in 0..self.positions {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("Position {}", slot + 1));
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.defaults[slot])
+                                            .char_limit(4096),
+                                    );
+                                });
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Response contains");
+                            ui.add(egui::TextEdit::singleline(&mut self.matcher).char_limit(256));
+                            ui.checkbox(&mut self.stop_on_match, "Stop on match");
+                        });
+                    });
+                    ui.label("{{payload}}")
+                        .on_hover_text("Use {{payload}}, {{payload2}}, etc. in the request");
                 });
                 match self.payload_mode {
                     PayloadMode::Charset | PayloadMode::Random => {
@@ -1051,24 +1109,14 @@ impl Workflow {
         if tab == Tab::Replay {
             ui.horizontal(|ui| {
                 if ui.button("Copy as cURL (redacted)").clicked() {
-                    let result = crate::state::resolve(&tool.destination, &self.variables)
-                        .and_then(|destination| {
-                            crate::state::resolve(&tool.request, &self.variables).and_then(
-                                |request| crate::interchange::curl(&destination, &request, true),
-                            )
-                        });
+                    let result = tool.curl(&self.variables, true);
                     match result {
                         Ok(command) => ui.ctx().copy_text(command),
                         Err(error) => self.message = error,
                     }
                 }
                 if ui.button("Copy as cURL").clicked() {
-                    let result = crate::state::resolve(&tool.destination, &self.variables)
-                        .and_then(|destination| {
-                            crate::state::resolve(&tool.request, &self.variables).and_then(
-                                |request| crate::interchange::curl(&destination, &request, false),
-                            )
-                        });
+                    let result = tool.curl(&self.variables, false);
                     match result {
                         Ok(command) => ui.ctx().copy_text(command),
                         Err(error) => self.message = error,
@@ -1095,22 +1143,29 @@ impl Workflow {
                 }
             });
         }
-        ui.horizontal(|ui| {
-            ui.menu_button("Request options", |ui| {
-                ui.label("Group");
-                ui.add(
-                    egui::TextEdit::singleline(&mut tool.group)
-                        .char_limit(64)
-                        .min_size(egui::vec2(160.0, 20.0)),
-                );
-                ui.label("Timeout (seconds; 0 uses Settings)");
-                ui.add(egui::DragValue::new(&mut tool.timeout_secs).range(0..=86400));
-                ui.label("Redirects are not followed automatically.");
+        if tab == Tab::Replay {
+            ui.horizontal(|ui| {
+                ui.menu_button("Request options", |ui| {
+                    ui.label("Group");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut tool.group)
+                            .char_limit(64)
+                            .min_size(egui::vec2(160.0, 20.0)),
+                    );
+                    ui.label("Timeout (seconds; 0 uses Settings)");
+                    ui.add(egui::DragValue::new(&mut tool.timeout_secs).range(0..=86400));
+                    ui.label("Redirects are not followed automatically.");
+                });
             });
+        }
+        ui.horizontal(|ui| {
+            ui.label(&tool.status);
+            if let Some(count) = planned {
+                ui.weak(format!("{count} requests"));
+            }
         });
-        ui.label(&tool.status);
         let width = ui.available_width();
-        let height = (ui.available_height() - 30.0).max(160.0);
+        let height = (ui.available_height() - 16.0).max(90.0);
         let left = egui::Panel::left(egui::Id::new(("request-split", tool.editor_id)))
             .resizable(true)
             .default_size(width * self.settings.request_ratio)
@@ -1133,23 +1188,53 @@ impl Workflow {
             });
         self.settings.request_ratio = (left.response.rect.width() / width).clamp(0.15, 0.85);
         egui::CentralPanel::default().show(ui, |ui| {
+            let mut response_jump = None;
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Response");
                 let previous = tool.response_mode;
-                for (mode, label) in [(0, "Raw"), (1, "Pretty"), (2, "Hex"), (3, "Decoded")] {
+                for (mode, label) in [
+                    (4, "Auto"),
+                    (0, "Raw"),
+                    (1, "Pretty"),
+                    (2, "Hex"),
+                    (3, "Decoded"),
+                ] {
                     ui.selectable_value(&mut tool.response_mode, mode, label);
                 }
                 if previous != tool.response_mode {
                     tool.response = tool.response_view();
                 }
             });
-            ui.horizontal(|ui| {
+            if let Some(note) = &tool.response_note {
+                ui.weak(note);
+            }
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Find");
-                ui.add(
+                let search = ui.add(
                     egui::TextEdit::singleline(&mut tool.response_find)
                         .desired_width(120.0)
                         .char_limit(256),
                 );
+                if search.changed() {
+                    tool.response_search_next = 0;
+                }
+                let next = ui
+                    .add_enabled(
+                        !tool.response_find.is_empty(),
+                        egui::Button::new("Next match"),
+                    )
+                    .clicked()
+                    || (search.lost_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                if next {
+                    response_jump = syntax::find_next(
+                        ui,
+                        egui::Id::new(("response", tool.editor_id)),
+                        &tool.response,
+                        &tool.response_find,
+                        &mut tool.response_search_next,
+                    );
+                }
                 if !tool.response_find.is_empty() {
                     ui.label(format!(
                         "{} matches",
@@ -1157,9 +1242,11 @@ impl Workflow {
                     ));
                 }
             });
-            egui::ScrollArea::both()
-                .id_salt(("tool-response", tool.editor_id))
-                .max_height(height)
+            let mut area = egui::ScrollArea::both().id_salt(("tool-response", tool.editor_id));
+            if let Some(line) = response_jump {
+                area = area.vertical_scroll_offset(line as f32 * (self.settings.font_size + 3.0));
+            }
+            area.max_height(height)
                 .min_scrolled_height(height)
                 .show(ui, |ui| {
                     syntax::editor(
@@ -1178,7 +1265,7 @@ impl Workflow {
             cancel.send_replace(true);
         }
     }
-    fn browser(&mut self, ui: &mut egui::Ui) {
+    pub(super) fn browser(&mut self, ui: &mut egui::Ui) {
         ui.heading("Browser");
         ui.horizontal(|ui| {
             ui.label("Executable");
@@ -1198,7 +1285,16 @@ impl Workflow {
             );
         });
         ui.horizontal(|ui| {
-            if ui.button("Launch browser").clicked() {
+            if ui
+                .add_enabled(
+                    self.trust_ready && self.listener_ready,
+                    egui::Button::new("Launch browser"),
+                )
+                .on_disabled_hover_text(
+                    "Waiting for the proxy listener and HTTPS certificate setup. See Certificates.",
+                )
+                .clicked()
+            {
                 self.launch_browser();
             }
             if ui.button("Stop browser").clicked()
@@ -1209,9 +1305,11 @@ impl Workflow {
         });
         ui.label(&self.browser_status);
         ui.label(format!("Proxy: http://{}", self.listen));
-        ui.label(
-            "HTTPS capture is configured in Settings; the test browser must trust the project CA.",
-        );
+        ui.label(if self.trust_ready {
+            "HTTPS certificate setup is ready."
+        } else {
+            "HTTPS certificate setup is pending or failed; see Certificates."
+        });
         ui.collapsing("Browser details", |ui| {
             ui.label("Uses an isolated temporary profile; your normal profile is not changed.");
             ui.label("Certificate verification and the browser sandbox remain enabled.");
@@ -1226,6 +1324,7 @@ impl Spike {
                 self.receive(event);
             }
             while let Some(mut record) = self.workflow.completed.pop_front() {
+                self.features.results_dirty = true;
                 record.capture_id =
                     self.history
                         .entries
@@ -1265,9 +1364,15 @@ impl Spike {
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Open browser").clicked() {
+                if ui
+                    .add_enabled(
+                        self.workflow.trust_ready && self.workflow.listener_ready,
+                        egui::Button::new("Open browser"),
+                    )
+                    .on_disabled_hover_text("Waiting for the proxy listener and HTTPS certificate setup. See Settings / Certificates.")
+                    .clicked()
+                {
                     self.workflow.launch_browser();
-                    self.workflow.tab = Tab::Browser;
                 }
             });
         });
@@ -1290,13 +1395,9 @@ impl Spike {
                 ),
                 (Tab::Replay, "Replay".into()),
                 (Tab::Intruder, "Intruder".into()),
-                (Tab::Browser, "Browser".into()),
-                (Tab::Target, "Target".into()),
-                (Tab::Variables, "Variables".into()),
                 (Tab::Compare, "Compare".into()),
-                (Tab::Results, "Results".into()),
-                (Tab::Project, "Project".into()),
                 (Tab::Settings, "Settings".into()),
+                (Tab::Coder, "Coder".into()),
             ] {
                 if ui
                     .add_sized(
@@ -1318,22 +1419,23 @@ impl Spike {
                 self.features.state.settings.request_ratio = self.workflow.settings.request_ratio;
             }
             Tab::Intruder => {
-                self.workflow.tool(ui, Tab::Intruder);
+                let height = ui.available_height();
+                let results_height = (height * 0.34).clamp(190.0, 260.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(
+                        ui.available_width(),
+                        (height - results_height - 12.0).max(230.0),
+                    ),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        self.workflow.tool(ui, Tab::Intruder);
+                    },
+                );
                 self.features.state.settings.request_ratio = self.workflow.settings.request_ratio;
-            }
-            Tab::Browser => {
-                self.workflow.browser(ui);
-                self.features.state.settings.browser = self.workflow.settings.browser.clone();
-                self.features.state.settings.browser_url =
-                    self.workflow.settings.browser_url.clone();
+                ui.separator();
+                self.results_view(ui);
             }
             _ => self.feature_tab(ui),
-        }
-        if !self.features.message.is_empty() {
-            ui.colored_label(WARN, &self.features.message);
-        }
-        if !self.workflow.message.is_empty() {
-            ui.colored_label(ERROR, &self.workflow.message);
         }
     }
 }
@@ -1341,6 +1443,75 @@ impl Spike {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_replay_cannot_redisplay_a_previous_response_when_switching_views() {
+        let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());
+        let (tx, rx) = mpsc::channel(1);
+        workflow.results = rx;
+        let (cancel, _) = watch::channel(false);
+        workflow.active = Some((1, Tab::Replay, cancel));
+        workflow.replays[0].response_bytes = b"HTTP/1.1 200 OK\r\n\r\nOLD RESULT".to_vec();
+        workflow.replays[0].last_target = "http://old/".into();
+        tx.try_send(ResultEvent {
+            id: 1,
+            index: 0,
+            elapsed: Duration::ZERO,
+            result: Err("Connection refused".into()),
+            done: true,
+            total: 1,
+            payloads: vec![],
+            terminal: false,
+        })
+        .unwrap();
+        let events = workflow.poll();
+        assert!(matches!(&events[0], Event::Error(error) if error == "Connection refused"));
+        assert!(workflow.active.is_none());
+        for mode in 0..=4 {
+            workflow.replays[0].response_mode = mode;
+            assert!(workflow.replays[0].response_view().is_empty());
+        }
+        assert!(workflow.replays[0].response_bytes.is_empty());
+        assert!(workflow.replays[0].last_target.is_empty());
+    }
+    #[test]
+    fn redacted_curl_masks_secret_variables_in_custom_headers() {
+        let mut tool = Tool::new();
+        tool.destination = "https://local".into();
+        tool.request =
+            "GET /?token=query-secret HTTP/1.1\r\nX-Custom: {{credential}}\r\n\r\n".into();
+        let variables = [crate::state::Variable {
+            key: "credential".into(),
+            value: "header-secret".into(),
+            secret: true,
+            enabled: true,
+        }];
+        let redacted = tool.curl(&variables, true).unwrap();
+        assert!(!redacted.contains("query-secret"));
+        assert!(!redacted.contains("header-secret"));
+        assert!(redacted.contains("X-Custom: [REDACTED]"));
+        let complete = tool.curl(&variables, false).unwrap();
+        assert!(complete.contains("query-secret") && complete.contains("header-secret"));
+    }
+    #[test]
+    fn replay_starts_with_readable_gzip_while_raw_retains_encoded_bytes() {
+        use std::io::Write;
+        let mut tool = Tool::new();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(b"window.fixture = 'readable';").unwrap();
+        tool.response_bytes = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
+        tool.response_bytes.extend(encoder.finish().unwrap());
+        assert!(
+            tool.response_view()
+                .contains("window.fixture = 'readable';")
+        );
+        tool.response_mode = 0;
+        assert_eq!(tool.response_view(), preview(&tool.response_bytes, PREVIEW));
+        tool.response_mode = 1;
+        assert!(
+            tool.response_view()
+                .contains("window.fixture = 'readable';")
+        );
+    }
     #[test]
     fn an_in_flight_wordlist_cannot_dispatch_a_stale_source() {
         let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());

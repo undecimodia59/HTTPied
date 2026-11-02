@@ -12,7 +12,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev
+        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libnss3-tools
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - run: cargo test --locked --all-features

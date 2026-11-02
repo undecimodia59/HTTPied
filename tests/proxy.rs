@@ -68,7 +68,7 @@ async fn post_preserves_raw_headers_and_query_and_body() {
     });
     let (addr, stop, mut events, task) = start(Config::default()).await;
     let input = format!(
-        "POST http://{host}/a%2fb?q=%20 HTTP/1.1\r\nHost: {host}\r\nx-Mix:  one\r\nX-Mix:\ttwo\r\nContent-Length: 5\r\nProxy-Authorization: secret\r\n\r\nhello"
+        "POST http://{host}/a%2fb?q=%20 HTTP/1.1\r\nHost: {host}\r\nx-Mix:  one\r\nX-Mix:\ttwo\r\nCookie: first=1\r\nCookie: second=2\r\nContent-Length: 5\r\nProxy-Authorization: secret\r\n\r\nhello"
     );
     let result = request(addr, input.as_bytes()).await;
     assert!(result.ends_with(b"ok"));
@@ -79,6 +79,10 @@ async fn post_preserves_raw_headers_and_query_and_body() {
             .any(|w| w == b"x-Mix:  one\r\nX-Mix:\ttwo\r\n")
     );
     assert!(!String::from_utf8_lossy(&wire).contains("secret"));
+    assert!(
+        wire.windows(b"Cookie: first=1\r\nCookie: second=2\r\n".len())
+            .any(|bytes| bytes == b"Cookie: first=1\r\nCookie: second=2\r\n")
+    );
     match events.recv().await.unwrap() {
         Event::Exchange(e) => {
             assert_eq!(e.original.0, input.as_bytes());

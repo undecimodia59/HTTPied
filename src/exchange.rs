@@ -1,61 +1,134 @@
 //! Loss-aware view and exchange helpers; no JavaScript or HTML execution.
 use crate::model::Event;
-pub fn redact(event: &mut Event) {
-    if let Event::WebSocket { payload, .. } = event {
-        *payload = b"[REDACTED]".to_vec();
-    }
-    if let Event::Exchange(e) = event {
-        if let Some(run) = &mut e.run {
-            run.payloads = vec!["[REDACTED]".into()];
+/// Redact query/fragment values and userinfo without modifying the captured observation.
+pub(crate) fn redacted_url(target: &str) -> String {
+    if let Ok(mut url) = url::Url::parse(target) {
+        if !url.username().is_empty() {
+            let _ = url.set_username("REDACTED");
         }
-        for (name, value) in &mut e.parsed.headers {
-            if [
-                "authorization",
-                "proxy-authorization",
-                "cookie",
-                "set-cookie",
-            ]
-            .iter()
-            .any(|n| name.eq_ignore_ascii_case(n))
-            {
-                *value = b"[REDACTED]".to_vec();
+        if url.password().is_some() {
+            let _ = url.set_password(Some("REDACTED"));
+        }
+        if url.query().is_some() {
+            url.set_query(Some("REDACTED"));
+        }
+        if url.fragment().is_some() {
+            url.set_fragment(Some("REDACTED"));
+        }
+        url.into()
+    } else {
+        // Origin-form targets and relative Location headers also carry credentials.
+        let end = target.find(['?', '#']).unwrap_or(target.len());
+        format!(
+            "{}{}",
+            &target[..end],
+            if end < target.len() { "?REDACTED" } else { "" }
+        )
+    }
+}
+pub(crate) fn sensitive_header(name: &str) -> bool {
+    [
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "x-auth-token",
+        "x-access-token",
+    ]
+    .iter()
+    .any(|sensitive| name.eq_ignore_ascii_case(sensitive))
+}
+pub(crate) fn redacted_header(name: &str, value: &str) -> String {
+    if sensitive_header(name) {
+        "[REDACTED]".into()
+    } else if ["location", "content-location", "referer"]
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+    {
+        redacted_url(value)
+    } else {
+        value.to_owned()
+    }
+}
+fn redacted_message(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return vec![];
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let head = text
+        .split_once("\r\n\r\n")
+        .or_else(|| text.split_once("\n\n"))
+        .map_or(text.as_ref(), |(head, _)| head);
+    let mut lines = head.lines();
+    let mut result = String::new();
+    if let Some(first) = lines.next() {
+        if first.starts_with("HTTP/") {
+            result.push_str(first);
+        } else {
+            let parts = first.split_whitespace().collect::<Vec<_>>();
+            if parts.len() == 3 {
+                result.push_str(&format!(
+                    "{} {} {}",
+                    parts[0],
+                    redacted_url(parts[1]),
+                    parts[2]
+                ));
+            } else {
+                result.push_str("[Request line omitted in redacted export]");
             }
         }
-        for bytes in [
-            &mut e.original.0,
-            &mut e.outgoing,
-            &mut e.response,
-            &mut e.response_outgoing,
-        ] {
-            if bytes.is_empty() {
+        result.push_str("\r\n");
+    }
+    for line in lines {
+        // Obsolete folded fields may continue a credential. Omit all continuations.
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            // The exported body is replaced; its old framing/encoding no longer applies.
+            if ["content-length", "transfer-encoding", "content-encoding"]
+                .iter()
+                .any(|n| name.eq_ignore_ascii_case(n))
+            {
                 continue;
             }
-            let text = String::from_utf8_lossy(bytes);
-            let split = text.find("\r\n\r\n").unwrap_or(text.len());
-            let head = &text[..split];
-            let mut result = String::new();
-            for line in head.split("\r\n") {
-                if let Some((name, _)) = line.split_once(':')
-                    && [
-                        "authorization",
-                        "proxy-authorization",
-                        "cookie",
-                        "set-cookie",
-                    ]
-                    .iter()
-                    .any(|n| name.eq_ignore_ascii_case(n))
-                {
-                    result.push_str(&format!("{name}: [REDACTED]\r\n"));
-                } else {
-                    result.push_str(line);
-                    result.push_str("\r\n");
-                }
-            }
-            if split < text.len() {
-                result.push_str("\r\n[Body omitted in redacted export]");
-            }
-            *bytes = result.into_bytes();
+            result.push_str(&format!(
+                "{name}: {}\r\n",
+                redacted_header(name, value.trim())
+            ));
         }
+    }
+    result.push_str("\r\n[Body omitted in redacted export]");
+    result.into_bytes()
+}
+pub fn redact(event: &mut Event) {
+    match event {
+        Event::WebSocket {
+            payload, target, ..
+        } => {
+            *payload = b"[REDACTED]".to_vec();
+            *target = redacted_url(target);
+        }
+        Event::Exchange(e) => {
+            e.parsed.target = redacted_url(&e.parsed.target);
+            if let Some(run) = &mut e.run {
+                run.payloads = vec!["[REDACTED]".into()];
+            }
+            for (name, value) in &mut e.parsed.headers {
+                *value = redacted_header(name, &String::from_utf8_lossy(value)).into_bytes();
+            }
+            for bytes in [
+                &mut e.original.0,
+                &mut e.outgoing,
+                &mut e.response,
+                &mut e.response_outgoing,
+            ] {
+                *bytes = redacted_message(bytes);
+            }
+        }
+        _ => {}
     }
 }
 pub fn pretty(text: &str) -> String {
@@ -176,99 +249,7 @@ pub fn comparison_view(text: &str, ignored: &str, hex: bool) -> String {
     }
 }
 
-/// Decode captured transfer/content encodings into a separate bounded body view.
-pub fn decoded(bytes: &[u8]) -> Result<String, String> {
-    if bytes.len() > 2 * 1024 * 1024 {
-        return Err("Decoder input exceeds 2 MiB; use a smaller capture".into());
-    }
-    let output = decoded_bytes(bytes, 256 * 1024)?;
-    let text = std::str::from_utf8(&output)
-        .map_err(|_| "Decoded body is binary; use Hex for the original bytes")?;
-    Ok(format!(
-        "[Decoded body; original bytes preserved]\r\n\r\n{text}"
-    ))
-}
-pub fn decoded_bytes(bytes: &[u8], limit: usize) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let split = bytes
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("Message has no complete head")?;
-    let head = String::from_utf8_lossy(&bytes[..split]);
-    let header = |name: &str| {
-        head.lines()
-            .skip(1)
-            .filter_map(|l| l.split_once(':'))
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.trim().to_ascii_lowercase())
-            .unwrap_or_default()
-    };
-    let mut body = bytes[split + 4..].to_vec();
-    if header("transfer-encoding") == "chunked" {
-        let mut output = Vec::new();
-        let mut rest = body.as_slice();
-        loop {
-            let end = rest
-                .windows(2)
-                .position(|w| w == b"\r\n")
-                .ok_or("Truncated chunk size")?;
-            let line = std::str::from_utf8(&rest[..end])
-                .map_err(|_| "Invalid chunk size")?
-                .split(';')
-                .next()
-                .unwrap_or("");
-            let size = usize::from_str_radix(line, 16).map_err(|_| "Invalid chunk size")?;
-            rest = &rest[end + 2..];
-            if size == 0 {
-                break;
-            }
-            if size > rest.len().saturating_sub(2) || rest.get(size..size + 2) != Some(b"\r\n") {
-                return Err("Truncated chunk body".into());
-            }
-            if output.len() + size > limit {
-                return Err("Decoded body exceeds the view/export limit".into());
-            }
-            output.extend_from_slice(&rest[..size]);
-            rest = &rest[size + 2..];
-        }
-        body = output;
-    }
-    let encoding = header("content-encoding");
-    let mut output = Vec::new();
-    match encoding.as_str() {
-        "" | "identity" => output = body,
-        "gzip" => {
-            flate2::read::GzDecoder::new(body.as_slice())
-                .take(limit as u64 + 1)
-                .read_to_end(&mut output)
-                .map_err(|e| e.to_string())?;
-        }
-        "deflate" => {
-            if flate2::read::ZlibDecoder::new(body.as_slice())
-                .take(limit as u64 + 1)
-                .read_to_end(&mut output)
-                .is_err()
-            {
-                output.clear();
-                flate2::read::DeflateDecoder::new(body.as_slice())
-                    .take(limit as u64 + 1)
-                    .read_to_end(&mut output)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        "br" => {
-            brotli::Decompressor::new(body.as_slice(), 4096)
-                .take(limit as u64 + 1)
-                .read_to_end(&mut output)
-                .map_err(|e| e.to_string())?;
-        }
-        _ => return Err(format!("Unsupported Content-Encoding: {encoding}")),
-    }
-    if output.len() > limit {
-        return Err("Decoded body exceeds the view/export limit".into());
-    }
-    Ok(output)
-}
+pub use crate::decoding::{auto_preview, decoded, decoded_bytes, decoded_message, needs_decoding};
 pub fn parameters(bytes: &[u8], target: &str) -> String {
     let mut out = String::new();
     if let Ok(url) = url::Url::parse(target) {
@@ -308,6 +289,106 @@ pub fn parameters(bytes: &[u8], target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn redaction_removes_credentials_from_every_exported_representation() {
+        let mut event = crate::interchange::raw(b"POST https://user:password@local/path?token=query-secret HTTP/1.1\r\nHost: local\r\nAuthorization: auth-secret\r\nX-Api-Key: key-secret\r\nCookie: cookie-secret\r\nReferer: https://local/?session=referer-secret\r\nContent-Length: 11\r\n\r\nbody-secret").unwrap();
+        let Event::Exchange(e) = &mut event else {
+            panic!()
+        };
+        e.response = b"HTTP/1.1 302 Found\r\nLocation: /next?token=redirect-secret\r\nSet-Cookie: response-secret\r\nContent-Encoding: gzip\r\n\r\nresponse-body-secret".to_vec();
+        e.response_outgoing = e.response.clone();
+        let original = serde_json::to_string(&event).unwrap();
+        redact(&mut event);
+        let Event::Exchange(e) = &event else { panic!() };
+        let json = serde_json::to_string(&event).unwrap();
+        let har = crate::interchange::har_entry(e).to_string();
+        for secret in [
+            "user",
+            "password",
+            "query-secret",
+            "auth-secret",
+            "key-secret",
+            "cookie-secret",
+            "referer-secret",
+            "body-secret",
+            "redirect-secret",
+            "response-secret",
+            "response-body-secret",
+        ] {
+            assert!(!e.parsed.target.contains(secret), "{secret}");
+            for bytes in [
+                &e.original.0,
+                &e.outgoing,
+                &e.response,
+                &e.response_outgoing,
+            ] {
+                assert!(!String::from_utf8_lossy(bytes).contains(secret), "{secret}");
+            }
+            assert!(!json.contains(secret) && !har.contains(secret), "{secret}");
+        }
+        assert!(original.contains("query-secret"));
+        assert!(String::from_utf8_lossy(&e.outgoing).contains("/path?REDACTED"));
+        assert!(!String::from_utf8_lossy(&e.response).contains("Content-Encoding"));
+    }
+    #[test]
+    fn redaction_omits_folded_credentials_and_websocket_url_secrets() {
+        let bytes =
+            redacted_message(b"GET /?token=secret HTTP/1.1\nAuthorization: one\n two\n\npayload");
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            !text.contains("secret")
+                && !text.contains("one")
+                && !text.contains("two")
+                && !text.contains("payload")
+        );
+        let mut event = Event::WebSocket {
+            connection: 1,
+            target: "wss://local/socket?token=secret".into(),
+            direction: "client".into(),
+            kind: "text".into(),
+            payload: b"payload".to_vec(),
+            total: 7,
+            truncated: false,
+            closed: false,
+        };
+        redact(&mut event);
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(!json.contains("secret"));
+        assert!(matches!(event, Event::WebSocket { payload, .. } if payload == b"[REDACTED]"));
+    }
+    #[test]
+    fn compressed_javascript_decodes_without_changing_captured_headers_or_bytes() {
+        use std::io::Write;
+        let js = "/*! local JS fixture */\nwindow.fixture = 'decoded ✓';\n";
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(js.as_bytes()).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/javascript; charset=utf-8\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            compressed.len()
+        );
+        let mut wire = header.as_bytes().to_vec();
+        wire.extend_from_slice(&compressed);
+        let original = wire.clone();
+        assert!(needs_decoding(&wire));
+        assert_eq!(decoded_message(&wire).unwrap(), format!("{header}{js}"));
+        assert_eq!(wire, original);
+        wire.pop();
+        assert!(decoded_message(&wire).is_err());
+        let mut chunked =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Encoding: gzip\r\n\r\n"
+                .to_vec();
+        chunked.extend_from_slice(format!("{:x}\r\n", compressed.len()).as_bytes());
+        chunked.extend_from_slice(&compressed);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        assert!(decoded_message(&chunked).unwrap().ends_with(js));
+        assert!(
+            decoded_message(b"HTTP/1.1 200 OK\r\nContent-Encoding: unknown\r\n\r\ndata")
+                .unwrap_err()
+                .contains("Unsupported")
+        );
+        assert!(!needs_decoding(b"HTTP/1.1 200 OK\r\n\r\nplain"));
+    }
     #[test]
     fn decoding_limits_expansion_and_preserves_the_capture() {
         use std::io::Write;

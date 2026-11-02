@@ -1,6 +1,25 @@
 //! Versioned project settings and pure filtering/scope/variable policy.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+/// Hostname and encoded path/query for independent History columns. Fragments are not sent.
+pub fn destination_parts(target: &str) -> (String, String) {
+    if let Ok(url) = url::Url::parse(target)
+        && let Some(host) = url.host_str()
+    {
+        return (
+            host.to_owned(),
+            url[url::Position::BeforePath..url::Position::AfterQuery].to_owned(),
+        );
+    }
+    // CONNECT targets contain an authority rather than a URL.
+    if !target.contains(['/', ' ', '\n', '\r'])
+        && let Ok(url) = url::Url::parse(&format!("http://{target}"))
+        && let Some(host) = url.host_str()
+    {
+        return (host.to_owned(), String::new());
+    }
+    (String::new(), String::new())
+}
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct Settings {
@@ -109,7 +128,16 @@ pub struct ScopeRule {
     pub path: String,
 }
 impl Default for ScopeRule {
-    fn default()->Self{Self{host:String::new(),exclude:false,subdomains:true,scheme:String::new(),port:String::new(),path:String::new()}}
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            exclude: false,
+            subdomains: true,
+            scheme: String::new(),
+            port: String::new(),
+            path: String::new(),
+        }
+    }
 }
 impl ScopeRule {
     pub fn matches(&self, url: &url::Url) -> bool {
@@ -148,7 +176,7 @@ pub fn in_scope(rules: &[ScopeRule], target: &str) -> bool {
     !rules.iter().any(|r| r.exclude && r.matches(&url))
         && rules.iter().any(|r| !r.exclude && r.matches(&url))
 }
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct HistoryFilter {
     pub text: String,
@@ -156,6 +184,7 @@ pub struct HistoryFilter {
     pub excluded_extensions: String,
     pub mime: String,
     pub in_scope: bool,
+    pub show_ws: bool,
     pub show_tunnels: bool,
     pub errors_only: bool,
     pub method: String,
@@ -164,6 +193,26 @@ pub struct HistoryFilter {
     pub min_bytes: u64,
     pub sort_by: String,
     pub descending: bool,
+}
+impl Default for HistoryFilter {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            extensions: String::new(),
+            excluded_extensions: String::new(),
+            mime: String::new(),
+            in_scope: false,
+            show_ws: true,
+            show_tunnels: false,
+            errors_only: false,
+            method: String::new(),
+            status: String::new(),
+            min_ms: 0.0,
+            min_bytes: 0,
+            sort_by: String::new(),
+            descending: false,
+        }
+    }
 }
 impl HistoryFilter {
     fn extension_allows(&self, target: &str) -> bool {
@@ -194,7 +243,10 @@ impl HistoryFilter {
         use crate::model::Event;
         match event {
             Event::Exchange(e) => {
-                if self.errors_only {
+                if !self.show_ws && e.protocol == "WebSocket handshake" {
+                    return false;
+                }
+                if self.errors_only && e.response_status < 400 {
                     return false;
                 }
                 if self.in_scope && !in_scope(scope, &e.parsed.target) {
@@ -243,7 +295,8 @@ impl HistoryFilter {
                 total,
                 ..
             } => {
-                !self.errors_only
+                self.show_ws
+                    && !self.errors_only
                     && (self.method.is_empty() || self.method.eq_ignore_ascii_case("WS"))
                     && self.status.is_empty()
                     && self.mime.is_empty()
@@ -256,15 +309,7 @@ impl HistoryFilter {
                             .to_lowercase()
                             .contains(&self.text.to_lowercase()))
             }
-            Event::Error(message) => {
-                !self.in_scope
-                    && self.extensions.is_empty()
-                    && self.mime.is_empty()
-                    && self.method.is_empty()
-                    && self.status.is_empty()
-                    && (self.text.is_empty()
-                        || message.to_lowercase().contains(&self.text.to_lowercase()))
-            }
+            Event::Error(_) => false,
             Event::Listening(_) => false,
         }
     }
@@ -340,12 +385,13 @@ pub struct ProjectState {
     pub settings: Settings,
     pub scope: Vec<ScopeRule>,
     #[serde(default)]
-    pub scope_behavior:u8,
+    pub scope_behavior: u8,
     pub filter: HistoryFilter,
     pub presets: Vec<Preset>,
     pub variables: Vec<Variable>,
     pub replays: Vec<SavedRequest>,
     pub columns: Vec<String>,
+    pub column_widths: BTreeMap<String, f32>,
     pub rules: Vec<RewriteRule>,
     pub intercept_host: String,
     pub intercept_path: String,
@@ -354,14 +400,28 @@ pub struct ProjectState {
     pub intercept_mime: String,
 }
 impl ProjectState {
-    pub fn migrate_scope(&mut self){
-        if self.scope_behavior==0 {
-            if !self.settings.enforce_scope{for rule in &mut self.scope{if !rule.exclude{rule.subdomains=true;}}}
-            self.scope_behavior=1;
+    pub fn migrate_scope(&mut self) {
+        if self.scope_behavior == 0 {
+            if !self.settings.enforce_scope {
+                for rule in &mut self.scope {
+                    if !rule.exclude {
+                        rule.subdomains = true;
+                    }
+                }
+            }
+            self.scope_behavior = 1;
         }
     }
     pub fn validate(&self) -> Result<(), String> {
         self.settings.validate()?;
+        if self.column_widths.len() > 32
+            || self
+                .column_widths
+                .values()
+                .any(|width| !width.is_finite() || !(40.0..=2000.0).contains(width))
+        {
+            return Err("Column widths must be 40–2000 pixels".into());
+        }
         if self.variables.len() > 256
             || self.scope.len() > 256
             || self.rules.len() > 64
@@ -382,7 +442,8 @@ impl Default for ProjectState {
             version: 1,
             name: "Untitled".into(),
             settings: Settings::default(),
-            scope: vec![],scope_behavior:1,
+            scope: vec![],
+            scope_behavior: 1,
             filter: HistoryFilter::default(),
             presets: vec![
                 Preset {
@@ -397,7 +458,7 @@ impl Default for ProjectState {
                     },
                 },
                 Preset {
-                    name: "Errors".into(),
+                    name: "HTTP errors".into(),
                     filter: HistoryFilter {
                         errors_only: true,
                         ..Default::default()
@@ -415,16 +476,11 @@ impl Default for ProjectState {
             variables: vec![],
             replays: vec![],
             columns: [
-                "#",
-                "Method",
-                "Status",
-                "Protocol",
-                "Destination",
-                "Duration",
-                "Size",
+                "#", "Method", "Status", "Protocol", "Host", "Endpoint", "Duration", "Size",
             ]
             .map(str::to_owned)
             .to_vec(),
+            column_widths: BTreeMap::new(),
             rules: vec![],
             intercept_host: String::new(),
             intercept_path: String::new(),
@@ -456,9 +512,73 @@ pub fn size(bytes: u64, binary: bool) -> String {
     }
     format!("{value:.1} {}", units[index])
 }
+/// Human-readable protocol and separately inspectable HTTP/2 stream identifier.
+pub fn protocol_parts(protocol: &str) -> (&str, Option<u32>) {
+    if let Some(stream) = protocol.strip_prefix("HTTP/2 stream ") {
+        ("HTTP/2", stream.parse().ok())
+    } else {
+        (protocol, None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn destination_columns_preserve_path_query_and_host_boundaries() {
+        assert_eq!(
+            destination_parts("https://LAB.example:8443/a%2Fb.js?x=1&next=%2F#unused"),
+            ("lab.example".into(), "/a%2Fb.js?x=1&next=%2F".into())
+        );
+        assert_eq!(
+            destination_parts("https://[::1]:443/"),
+            ("[::1]".into(), "/".into())
+        );
+        assert_eq!(
+            destination_parts("example.test:443"),
+            ("example.test".into(), String::new())
+        );
+        assert_eq!(destination_parts("connection failed"), Default::default());
+        let mut state = ProjectState::default();
+        state.column_widths.insert("Host".into(), 320.0);
+        assert!(state.validate().is_ok());
+        state.column_widths.insert("Host".into(), f32::NAN);
+        assert!(state.validate().is_err());
+    }
+    #[test]
+    fn academy_domain_scope_includes_lab_hosts_and_keeps_enforced_legacy_scopes_narrow() {
+        let scope = vec![ScopeRule {
+            host: "web-security-academy.net".into(),
+            ..Default::default()
+        }];
+        assert!(in_scope(
+            &scope,
+            "https://0a12b3.web-security-academy.net/login"
+        ));
+        assert!(in_scope(&scope, "https://web-security-academy.net/"));
+        assert!(!in_scope(&scope, "https://notweb-security-academy.net/"));
+        let mut old = ProjectState {
+            scope_behavior: 0,
+            scope: vec![ScopeRule {
+                host: "web-security-academy.net".into(),
+                subdomains: false,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut enforced = old.clone();
+        enforced.settings.enforce_scope = true;
+        enforced.migrate_scope();
+        assert!(!in_scope(
+            &enforced.scope,
+            "https://lab.web-security-academy.net/"
+        ));
+        old.migrate_scope();
+        assert!(in_scope(
+            &old.scope,
+            "https://lab.web-security-academy.net/"
+        ));
+    }
     #[test]
     fn scope_matches_labels_not_suffixes() {
         let rules = vec![

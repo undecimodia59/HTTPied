@@ -12,16 +12,22 @@ pub fn curl(destination: &str, draft: &str, redact: bool) -> Result<String, Stri
     let mut command = format!(
         "curl --request {} {}",
         quote(&e.parsed.method),
-        quote(&e.parsed.target)
+        quote(&if redact {
+            crate::exchange::redacted_url(&e.parsed.target)
+        } else {
+            e.parsed.target.clone()
+        })
     );
     for (name, value) in &e.parsed.headers {
         if name.eq_ignore_ascii_case("content-length") {
             continue;
         }
-        let value = if redact && sensitive(name) {
-            "[REDACTED]".into()
+        let value =
+            String::from_utf8(value.clone()).map_err(|_| "Header contains non-UTF-8 bytes")?;
+        let value = if redact {
+            crate::exchange::redacted_header(name, &value)
         } else {
-            String::from_utf8(value.clone()).map_err(|_| "Header contains non-UTF-8 bytes")?
+            value
         };
         command.push_str(&format!(" --header {}", quote(&format!("{name}: {value}"))));
     }
@@ -38,16 +44,6 @@ pub fn curl(destination: &str, draft: &str, redact: bool) -> Result<String, Stri
         command.push_str(&format!(" --data-raw {}", quote(text)));
     }
     Ok(command)
-}
-fn sensitive(name: &str) -> bool {
-    [
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-    ]
-    .iter()
-    .any(|n| name.eq_ignore_ascii_case(n))
 }
 pub fn import_curl(text: &str) -> Result<Event, String> {
     let tokens = shlex::split(text).ok_or("Invalid cURL quoting")?;

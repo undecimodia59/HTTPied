@@ -19,14 +19,19 @@ actually present in this application.
 | Dummy local destinations and prefilled sample payloads | Empty destination/wordlist inputs; Browser starts at about:blank |
 | Recent-run cards and request-snapshot section | Removed; stable per-request native text editor undo/redo |
 | Multiple paragraphs repeating how each view works | Kept necessary transport/operation details in contextual help and the guide |
+| Scope, Variables, Browser, Project and results crowding the main navigation | Six task tabs; configuration in Settings; results below Intruder editors |
+| Settings mixing sections and a keyboard-binding dropdown | Consistent sidebar subsections |
+| Combined filter/column popup with tiny inputs and glyph-only reorder buttons | Separate aligned dialogs, readable input widths and Up/Down labels |
+| Interception fields too narrow and without format guidance | 330 px inputs with examples |
 
-The top-level Intercept / History / Replay / Intruder / Browser tabs remain because they are
-explicitly requested and support distinct tasks. Request/response panes remain framed for
+The top-level tabs are Intercept, History, Replay, Intruder, Compare and Settings.
+Request/response panes remain framed for
 selection and separation. There are no decorative gradients, fabricated metrics or fake
 workflow buttons. The standalone benchmark example remains a developer artifact, outside
 the application interface.
 
-Reviewed native screenshots: `revision-highlight.png`, `revision-sort.png`,
-`revision-numbers.png`, `revision-wordlist.png`. Aesthetic feedback on density, contrast and
+Reviewed current native screenshots: `revision2-settings-interception.png`,
+`revision2-settings-scope.png`, `revision2-history-filters.png`,
+`revision2-history-columns.png`, and `features-results-filled.png`. Aesthetic feedback on density, contrast and
 platform-native expectations is still useful; no claim of universally removing every
 possible "AI signature" is made.

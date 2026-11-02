@@ -143,6 +143,17 @@ pub fn editor(
     editable: bool,
     rows: usize,
 ) -> egui::Response {
+    editor_limited(ui, id, text, editable, rows, 128 * 1024)
+}
+pub(super) fn editor_limited(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    text: &mut String,
+    editable: bool,
+    rows: usize,
+    limit: usize,
+) -> egui::Response {
+    let selection_before = selected_text(ui.ctx(), id, text);
     // egui's built-in undo compares cursor positions as well as text. Keeping text-only
     // revisions preserves redo when the operator clicks or sends between undo and redo.
     let history = editable.then(|| {
@@ -211,7 +222,7 @@ pub fn editor(
                         .code_editor()
                         .frame(egui::Frame::NONE)
                         .layouter(&mut layouter)
-                        .char_limit(128 * 1024)
+                        .char_limit(limit)
                         .desired_width(f32::INFINITY)
                         .desired_rows(rows),
                 )
@@ -243,10 +254,84 @@ pub fn editor(
             .record(text, now, boundary);
     }
     if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), id) {
+        // A toolbar click is outside the editor, so TextEdit relinquishes focus
+        // while handling that click. Apply Find's selection after that handling.
+        if let Some(range) = ui.ctx().data_mut(|data| {
+            data.remove_temp::<egui::text::CCursorRange>(id.with("find-selection"))
+        }) {
+            state.cursor.set_char_range(Some(range));
+            ui.memory_mut(|memory| memory.request_focus(id));
+            ui.ctx().request_repaint();
+        }
         state.clear_undoer();
         state.store(ui.ctx(), id);
     }
+    selection_menu(ui, &response, id, text, selection_before);
     response
+}
+fn selected_text(ctx: &egui::Context, id: egui::Id, text: &str) -> Option<String> {
+    let range = egui::TextEdit::load_state(ctx, id)?
+        .cursor
+        .char_range()?
+        .as_sorted_char_range();
+    let start = usize::from(range.start);
+    let end = usize::from(range.end);
+    if start == end {
+        return None;
+    }
+    Some(
+        text.chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect(),
+    )
+}
+fn selection_menu(
+    ui: &mut egui::Ui,
+    response: &egui::Response,
+    id: egui::Id,
+    text: &str,
+    before: Option<String>,
+) {
+    let snapshot = id.with("context-selection");
+    if response.hovered()
+        && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary))
+    {
+        let selection = before
+            .or_else(|| selected_text(ui.ctx(), id, text))
+            .unwrap_or_default();
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(snapshot, selection));
+    }
+    response.context_menu(|ui| {
+        let selected = ui
+            .ctx()
+            .data(|data| data.get_temp::<String>(snapshot))
+            .unwrap_or_default();
+        let available = !selected.is_empty();
+        if ui
+            .add_enabled(available, egui::Button::new("Send selection to Coder"))
+            .clicked()
+        {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new("coder-selection"), selected.clone())
+            });
+            ui.close();
+        }
+        if ui
+            .add_enabled(available, egui::Button::new("Copy selection"))
+            .clicked()
+        {
+            ui.ctx().copy_text(selected);
+            ui.close();
+        }
+        if !available {
+            ui.weak("Select text with the mouse or Shift + arrows first.");
+        }
+    });
+}
+pub(super) fn take_coder_selection(ctx: &egui::Context) -> Option<String> {
+    ctx.data_mut(|data| data.remove_temp::<String>(egui::Id::new("coder-selection")))
 }
 pub fn forget_editor(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|data| {
@@ -260,6 +345,112 @@ pub fn forget_editor(ctx: &egui::Context, id: egui::Id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn right_click_preserves_unicode_selection_for_editable_and_readonly_menus() {
+        for editable in [true, false] {
+            let ctx = egui::Context::default();
+            let id = egui::Id::new("selection-context-regression");
+            let mut text = "aКиївz".to_owned();
+            let mut rect = egui::Rect::NOTHING;
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                rect = editor(ui, id, &mut text, editable, 3).rect;
+            });
+            output.textures_delta.clear();
+            let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(1),
+                    egui::text::CCursor::new(5),
+                )));
+            state.store(&ctx, id);
+            ctx.memory_mut(|memory| memory.request_focus(id));
+            let pos = rect.min + egui::vec2(10.0, 8.0);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Secondary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |ui| {
+                    editor(ui, id, &mut text, editable, 3);
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(
+                ctx.data(|data| data.get_temp::<String>(id.with("context-selection")))
+                    .as_deref(),
+                Some("Київ")
+            );
+            assert_eq!(text, "aКиївz");
+        }
+    }
+    #[test]
+    fn find_next_selects_unicode_matches_and_keeps_them_for_copy() {
+        let context = egui::Context::default();
+        let id = egui::Id::new("find-regression");
+        let mut text = "Header\nα one\nα two".to_owned();
+        let mut next = 0;
+        let mut button = egui::Rect::NOTHING;
+        for step in 0..5 {
+            let events = if step == 1 || step == 2 {
+                vec![
+                    egui::Event::PointerMoved(button.center()),
+                    egui::Event::PointerButton {
+                        pos: button.center(),
+                        button: egui::PointerButton::Primary,
+                        pressed: step == 1,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            } else if step == 4 {
+                vec![egui::Event::Copy]
+            } else {
+                vec![]
+            };
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let response = ui.button("Next match");
+                    button = response.rect;
+                    if response.clicked() {
+                        assert_eq!(find_next(ui, id, &text, "α two", &mut next), Some(2));
+                    }
+                    editor(ui, id, &mut text, false, 5);
+                },
+            );
+            output.textures_delta.clear();
+            if step == 4 {
+                assert!(output.platform_output.commands.iter().any(|command| {
+                    matches!(command, egui::OutputCommand::CopyText(text) if text == "α two")
+                }));
+            }
+            if step >= 2 {
+                assert!(next > 0, "button was not clicked in step {step}");
+                assert!(context.memory(|memory| memory.has_focus(id)));
+                let state = egui::TextEdit::load_state(&context, id).unwrap();
+                let range = state.cursor.char_range().unwrap().as_sorted_char_range();
+                assert_eq!(
+                    text.chars()
+                        .skip(usize::from(range.start))
+                        .take(usize::from(range.end) - usize::from(range.start))
+                        .collect::<String>(),
+                    "α two"
+                );
+            }
+        }
+    }
     #[test]
     fn highlighting_preserves_http_html_and_unicode_exactly() {
         let text =
@@ -345,13 +536,14 @@ pub fn find_next(
     let first = text[..at].chars().count();
     let end = first + query.chars().count();
     let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
-    state
-        .cursor
-        .set_char_range(Some(egui::text::CCursorRange::two(
-            egui::text::CCursor::new(first),
-            egui::text::CCursor::new(end),
-        )));
+    let range = egui::text::CCursorRange::two(
+        egui::text::CCursor::new(first),
+        egui::text::CCursor::new(end),
+    );
+    state.cursor.set_char_range(Some(range));
     state.store(ui.ctx(), id);
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id.with("find-selection"), range));
     ui.memory_mut(|memory| memory.request_focus(id));
     Some(text[..at].bytes().filter(|b| *b == b'\n').count())
 }

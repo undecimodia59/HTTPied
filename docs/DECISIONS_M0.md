@@ -161,3 +161,130 @@ or bypass verification. Tests use temporary trust stores. SHA-256 labels make se
 Scope/Variables/Browser/Project move into uniform Settings subsections; Intruder owns results.
 Domain scope includes children by default. Legacy display-only scope entries migrate to domain
 matching; explicitly enforced legacy execution scopes preserve their narrower host rules.
+
+Linux paths and trust flags follow Chromium's
+[certificate management documentation](https://chromium.googlesource.com/chromium/src/+/master/docs/linux/cert_management.md).
+Evidence: isolated NSS idempotence regression, native project/workflow smoke and real Chromium
+HTTPS fixture with certificate verification and sandbox enabled. Windows runtime validation
+remains outstanding. Public roots are retained after project close; removal/rotation UI is deferred.
+
+## ADR-026 — Independent URL columns, saved widths and automatic response decoding
+
+For the requested History changes, expose Host (hostname), Endpoint (path and query) and
+Destination (complete target) independently. Persist column widths in project state;
+drag header boundaries, double-click to restore automatic sizing. One horizontal scroll
+contains headers and virtualized rows. Add indexed host/endpoint metadata via a transactional,
+bounded-page schema migration so saved-history sorting covers the entire result set.
+
+Make Auto the initial inspector/Replay response view: decode transfer/content encodings into
+a bounded display copy with a visible note. Keep captured headers and wire bytes unchanged;
+Raw/Hex remain explicit original-byte views. Reuse existing gzip/deflate/Brotli decoders,
+report truncated/unsupported/binary content rather than presenting compressed bytes as text.
+No TLS or upstream verification changes. Validate using local compressed-JavaScript fixtures,
+saved-history migration/sorting, persisted widths and native header dragging/response inspection.
+
+## ADR-027 — Separate verbose diagnostic executable
+
+The operator requests evidence before transport fixes. Build `httpied-debug` with the same CLI/UI
+and networking behavior, plus trace-level tracing-subscriber output and a bounded asynchronous
+tracing-appender writer. Add connection/HTTP2 stream IDs, phase/duration/error-kind records around
+DNS/TCP/TLS/execution and stage-specific downstream handshake diagnostics. Retain existing dial,
+timeout, reset and retry behavior; no speculative transport fixes. Logs rotate with bounded file
+sizes, queue overflow counts are reported on exit, and the log path is printed on startup.
+The dependencies are optional under debug-logging. The regular executable remains unchanged.
+Implementation references: [tracing-subscriber formatting](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/fmt/index.html)
+and [tracing-appender queue behavior](https://docs.rs/tracing-appender/latest/tracing_appender/non_blocking/struct.NonBlockingBuilder.html).
+
+## ADR-028 — Coalesced, bounded DNS resolution after operator trace
+
+The supplied session records 11 five-second failures after DNS start and before any TCP
+attempt, while other streams resolve the same host in 4–7 ms and complete TCP/TLS. The adapter
+currently repeats system lookup for every HTTP/2 stream. Add a shared resolver to Config:
+coalesce concurrent identical lookups, cache successful answers for 30 seconds, retain at most
+128 hosts/ports and 32 addresses per answer, and cache failures briefly (500 ms). Shared futures
+survive cancellation of one waiter; lookup deadlines remain bounded. IP literals bypass DNS.
+Use the same resolver for CONNECT/HTTP/Replay so the initial lookup is reusable; invalidate an
+answer after all its TCP attempts fail. Keep sequential address ordering and TLS verification.
+Distinguish DNS deadline failures from TCP failures. Test with injected delayed lookups and
+concurrent local HTTPS/HTTP2 requests. This mitigates duplicate resolver pressure; the trace
+does not establish why the OS/DNS lookup stalled or explain the earlier, rotated-out TLS EOF.
+
+Also write a compact application-only diagnostic file independently from dependency TRACE
+output, so frame/window trace rotation cannot remove early connection failures from both logs.
+
+2026-11-02 clarification: the operator's AdGuard screenshot shows fast server processing.
+The original DNS-start timestamp precedes the resolver worker; it does not isolate queue time,
+OS resolver execution or packet delivery. Add actual worker queued/start/finish timing around
+the same standard ToSocketAddrs operation. A local test demonstrates queue-only expiry without
+attributing that mechanism to the historical incident. AdGuard's configured rate limit is also
+requested as a possible burst-related factor; no setting or drops are assumed or modified.
+
+## ADR-029 — Join HTTP/2 Cookie fields during HTTP/1 translation
+
+The supplied 98028 session's saved captures contain 37 lab HTTP 400 responses with the exact
+body `{"error":"Duplicate header names are not allowed"}`. Every rejected outgoing request
+contains two Cookie lines; its other header names are unique, and no rewrites are configured.
+The HTTP/2 adapter currently forwards split Cookie fields as duplicate HTTP/1 fields. Follow
+[RFC 9113 section 8.2.3](https://datatracker.ietf.org/doc/html/rfc9113#section-8.2.3): join their
+opaque values with `; ` when building HTTP/1. Record the normalization in capture transformations.
+Do not parse/deduplicate cookie names, modify raw HTTP/1 requests, collapse other duplicate
+fields or combine response Set-Cookie values. Validate before/after using a strict local HTTP/1
+fixture, then verified HTTPS/HTTP2 multiplexing. No remote lab requests are required.
+
+## ADR-030 — Bottom activity log, explicit stream IDs and resilient Auto view
+
+Move runtime errors and warnings out of request History into a bottom Logs drawer. Keep a
+bounded, searchable severity-filtered log with timestamps and repeated-message counts,
+persisted by the existing project worker in an additive table; expose historical Error
+captures there while keeping their original records intact. HTTP responses (including 4xx/5xx)
+remain traffic. Use HTTP/2 as the protocol label and a separate optional numeric Stream ID.
+
+Auto means display-only decoding, not recompression of wire traffic. Add mature zstd and
+encoding_rs libraries for Zstandard and declared text charsets. Decode repeated/stacked
+content encodings in reverse order with bounds at every stage; support gzip/x-gzip, zlib/raw
+deflate, Brotli, Zstandard and chunk framing. Sniff gzip when its header is absent. Render
+readable text; on binary/corrupt/unsupported data, keep captured bytes visible with a note.
+Explicit Decoded reports failures. Preserve raw bytes, framing headers and proxy behavior.
+Verify bounded logs/legacy migration, traffic isolation, codecs/chains/binary fallback and
+native footer/drawer interactions. No new top-level tab or networking work on the renderer.
+
+
+## ADR-031 — Focused usability and export privacy review (2026-11-02)
+
+Accepted for the user-requested review, with UI/usability prioritized. Keep the current native
+architecture and existing protocol behavior. Use one HistoryFilter match for live/saved views,
+fetch saved captures asynchronously for context actions, and retain bounded editor/previews.
+Clear response bytes and derived views together; apply Find selections after editor click
+handling so toolbar navigation retains focus and supports Copy.
+
+Use shared URL/header redaction for export and cURL, and mask configured secret variables
+before redacted cURL expansion. Replace complete URL queries rather than guessing sensitive
+parameter names. Redaction remains limited to documented fields and cannot identify arbitrary
+application secrets. Exported copies discard obsolete body framing when replacing bodies.
+
+Temporary projects must exclusively create their directory before acquiring project state;
+accepting a preexisting directory is incompatible with delete-on-exit ownership. Export files
+use mode 0600 on Unix and retain create-new/non-overwrite behavior. Windows retains inherited
+ACLs. No new dependencies, schema changes or trust-policy changes are introduced.
+
+Evidence and remaining platform/dependency review limits: `docs/REVIEW_2026-11-02.md`.
+
+
+## ADR-032 — Coder and selected-text transfers (2026-11-02)
+
+The operator requests a Coder tab and right-click transfer of mouse/keyboard text selections.
+Add bounded, session-only conversion state and a shared editor context action. Snapshot a
+selection before right-click focus changes, use character indexes for Unicode, and transfer
+through a single UI-local action slot. Captures and source editors remain independent.
+
+Reuse base64/percent-encoding and enable quick-xml's existing `escape-html` feature for HTML5
+named entities; no additional crate is needed. Keep URL percent encoding distinct from form
+encoding (`+` means space only in forms), validate malformed input, preserve decoded binary
+bytes and expose hex input/output plus explicit output-to-input chaining. Limit input to
+128 KiB of bytes and conversion output to 1 MiB. Do not save selected credentials to project
+state by adding Coder persistence.
+
+Reported EOF/reset logs lack destination/phase context. Enrich TLS, HTTPS and WebSocket
+errors while preserving failure semantics, certificate verification and truncation checks.
+The supplied excerpts cannot prove whether cancellation, peer behavior or a defect caused
+any individual failure. Do not globally suppress or downgrade these failures.
