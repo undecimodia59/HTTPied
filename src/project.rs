@@ -341,8 +341,8 @@ impl Project {
             let json: String = db
                 .query_row("SELECT json FROM state WHERE id=1", [], |row| row.get(0))
                 .map_err(|e| e.to_string())?;
-            if json.len() > 4 * 1024 * 1024 {
-                return Err("Project settings exceed 4 MiB".into());
+            if json.len() > 16 * 1024 * 1024 {
+                return Err("Project settings exceed 16 MiB".into());
             }
             let mut state: ProjectState = serde_json::from_str(&json).map_err(|e| e.to_string())?;
             if state.version != 1 {

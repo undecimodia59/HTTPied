@@ -38,11 +38,13 @@ impl Workflow {
     }
     pub(super) fn replay_sessions(&mut self, ui: &mut egui::Ui) {
         let groups = self.groups();
+        let active = self.active.is_some();
         egui::Panel::left("replay-collections")
             .resizable(true)
             .default_size(205.0)
             .size_range(160.0..=340.0)
             .show(ui, |ui| {
+                if active { ui.disable(); }
                 ui.strong("Replay requests");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.replay_search)
@@ -235,7 +237,9 @@ impl Workflow {
                     self.replay_groups.retain(|group| group != &old);
                 }
             });
-        ui.horizontal_wrapped(|ui| {
+        ui.scope(|ui| {
+            if active { ui.disable(); }
+            ui.horizontal_wrapped(|ui| {
             ui.strong(&self.replays[self.selected_replay].name);
             if ui
                 .add_enabled(
@@ -316,6 +320,7 @@ impl Workflow {
                     self.selected_replay = self.selected_replay.min(self.replays.len() - 1);
                     ui.close();
                 }
+            });
             });
         });
     }

@@ -1450,6 +1450,32 @@ mod tests {
         assert!(!text.contains("00002000"));
     }
     #[test]
+    fn replay_sidebar_keeps_the_request_editor_inside_the_viewport() {
+        let (_tx, rx) = mpsc::channel(1);
+        let mut app = Spike::new(rx, "127.0.0.1:8080".parse().unwrap());
+        app.features.open = true;
+        app.workflow.load(
+            b"GET http://local/visible-editor HTTP/1.1\r\nHost: local\r\n\r\n",
+            Tab::Replay,
+        );
+        let context = egui::Context::default();
+        theme(&context);
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(940.0, 700.0));
+        for _ in 0..2 {
+            let mut output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(viewport),
+                    ..Default::default()
+                },
+                |ui| app.content(ui),
+            );
+            assert!(output.shapes.iter().any(|shape| {
+                shape.clip_rect.intersects(viewport) && matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text().contains("GET /visible-editor"))
+            }),"Replay request editor was pushed below its viewport");
+            output.textures_delta.clear();
+        }
+    }
+    #[test]
     fn every_workflow_tab_renders_at_compact_size() {
         let (_tx, rx) = mpsc::channel(1);
         let mut app = Spike::new(rx, "127.0.0.1:8080".parse().unwrap());

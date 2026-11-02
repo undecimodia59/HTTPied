@@ -822,7 +822,9 @@ impl Workflow {
             None
         };
         if tab == Tab::Replay {
-            ui.add_enabled_ui(!active, |ui| self.replay_sessions(ui));
+            // Side panels must shrink this Ui directly. A surrounding scope would
+            // allocate their full height and push the editors below the viewport.
+            self.replay_sessions(ui);
         }
         let tool = if tab == Tab::Replay {
             &mut self.replays[self.selected_replay]
