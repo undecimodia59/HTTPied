@@ -1,83 +1,46 @@
 # Native UI validation
 
-Build and exercise the current project workflow:
+Build the normal and diagnostic desktop binaries, then run native checks:
 
 ```sh
-cargo build --locked --release --features ui
-python3 scripts/feature_smoke.py
+cargo build --locked --release --all-features
+python3 scripts/feature_smoke.py --screenshots-dir /tmp/httpied-glow-flow
+python3 scripts/feature_smoke.py --layout-only --screenshots-dir /tmp/httpied-glow-layout
 python3 scripts/trust_smoke.py
 ```
 
-Requires Linux Xvfb, libX11/libXtst, D-Bus, xclip, NSS `certutil` and ImageMagick. The smoke creates an
-isolated display, trust store and local HTTP fixture. It verifies saved project creation, actual
-Replay sends after Undo/Redo and cursor movement, Variables substitution, padded numeric
-Intruder requests, embedded attributed results, scope edits with the History flag enabled,
-orderly shutdown, project reopening and
-sending a recovered Replay draft. No public service is contacted.
-It also drags a real History header boundary and checks the saved width, then copies the
-default Replay response view for a local gzip JavaScript request and asserts readable code
-alongside the captured Content-Encoding header. `revision3-columns-resized.png` and
-`revision3-compressed-js-auto.png` record these interactions.
+Linux native smoke requires Xvfb, libX11/libXtst, D-Bus, xclip, NSS certutil and ImageMagick.
+It creates a private display, isolated project/trust store and local HTTP fixture. No public
+service is contacted and the operator's regular trust store is not modified.
 
-`--capture-only` checks temporary project creation/capture/shutdown.
-`--layout-only` captures six workspace tabs, Settings subsections and both History dialogs.
-Current layout images use `revision2-*.png`; populated workflows use `features-*.png` and
-`project-start.png`. Older `revision-*` / `workflow-*` images are historical.
-`revision_smoke.py` and `ui_smoke.py` forward to this current harness.
+The full workflow checks:
 
-`trust_smoke.py` additionally needs Chromium and OpenSSL. It uses `examples/setup_test_ca.rs`
-to create a project CA and install it into an isolated current-user NSS database, then starts
-a localhost HTTPS fixture and loads it in real headless Chromium. It checks the response body;
-certificate verification and Chromium's sandbox remain enabled. Neither smoke changes the
-operator's normal trust database. The tested browser was Chromium 156.0.8078.47 on Linux.
+- Keyboard selection (Shift+arrows) and mouse drag selection survive right-click and transfer
+  only the selected text to Coder. Base64 decoding produces the actual clipboard result.
+- Compare accepts paired messages and shows separate baseline/candidate results; screenshots
+  record aligned colored differences and shared scrolling.
+- Replay sends actual local requests, displays readable gzip JavaScript, and retains Undo/Redo
+  across cursor movement and sends.
+- Variables substitute into an executed Replay request; numeric Intruder payloads keep padding,
+  attribution and capture IDs in persisted results.
+- History's MIME search finds saved captures; Ctrl+R transfers the executed request.
+- Connection failures remain in Logs instead of traffic; the drawer and compact layouts render.
+- Closing/reopening a saved project recovers a variable-driven Replay request that executes again.
 
-The smoke reports first native-window detection, proxy readiness including automated form
-interactions, and idle process RSS. These are Xvfb/software-OpenGL measurements on one
-machine, not cold-launch or Windows/Wayland certification.
+`--layout-only` captures all seven task tabs and all ten Settings sections. `--capture-only`
+checks temporary-session startup, real capture and graceful shutdown. Existing `--review-only`
+and `--history-only` flags run the current full workflow. Screenshots default to docs/screenshots;
+use `--screenshots-dir` for disposable verification output. Current images use `glow-*.png`.
+Older revision/features/workflow images are historical.
 
-Network/storage tests separately cover TLS trust/expiry/hostname verification, HTTP/2
-streaming beyond the capture cap, bidirectional WebSocket capture, 10 MiB HTTP streaming,
-interception/rewrite fidelity, import rollback, paging, scope matching, expansion limits,
-attack generation and cancellation while results are backpressured.
-`tests/h2_cookies.rs` rejects duplicate Cookie lines at a strict local origin and checks
-HTTP/2 split-cookie joining, exact forwarded values, capture annotation, preserved custom
-duplicate fields and separate response Set-Cookie fields. The verified TLS/HTTP2 fixture
-also sends split cookies on all nine streams; raw HTTP/1 tests retain intentional duplicates.
-URL-part migration tests cover multiple saved pages, IPv6, encoded paths/queries and saved
-column widths. Verified HTTPS Replay checks both gzip wire bytes and the decoded JavaScript.
-The same local fixture also exercises localhost DNS and eight concurrent additional HTTP/2
-streams. Resolver tests inject delayed/pending lookups to verify coalescing, cached reuse,
-cancellation, expiry and DNS-specific deadlines without querying a public service.
+The Rust suite covers Unicode context-menu selection, Find focus/Copy, conversion variants and
+malformed/binary/oversized data, diff alignment and bounds, compact layouts, project recovery,
+TLS verification and early EOF diagnostics, HTTP/2, WebSockets, framing and cancellation.
+The abrupt-WebSocket fixture checks that target, direction and failure remain visible.
 
-To capture fixture diagnostics into a temporary caller-chosen directory, set
-`HTTPIED_TEST_DEBUG_LOGS=1` and `HTTPIED_DEBUG_LOG_DIR=/path/to/test-logs`, then run
-`cargo test --locked --all-features --test project_https`. The `.summary.log` should show one
-localhost lookup and shared/cached use, with successful TLS and nine completed HTTP/2 streams.
+`trust_smoke.py` additionally requires Chromium and OpenSSL. It verifies a local HTTPS fixture
+using an isolated NSS store, with the Chromium sandbox and certificate verification enabled.
 
-Manual platform checks still needed: Windows file picker/browser cleanup, hardware OpenGL,
-Wayland clipboard/IME, screen-reader operation, long-running mixed-protocol workloads.
-
-ADR-030 regression coverage: bounded/coalesced diagnostics, durable log retention/clearing,
-legacy Error migration without capture deletion, exclusion from both plain and filtered History
-and traffic exports, HTTP status filtering, numeric Stream ID sorting across saved pages,
-all supported codecs, stacked/repeated headers, chunk trailers, declared charsets, magic sniffing,
-binary fallback, malformed/truncated data and expansion limits. `scripts/feature_smoke.py`
-checks native Replay gzip text and binary fallback, induces a refused local upstream, asserts
-it is persisted only in app_logs, and captures the bottom drawer/search UI. It uses an isolated
-project and trust directory; screenshots are under `docs/screenshots/revision4-*.png`.
-
-
-## Review regression smoke (2026-11-02)
-
-```sh
-cargo build --locked --release --features ui
-python3 scripts/feature_smoke.py --review-only --screenshots-dir /tmp/httpied-review-screenshots
-python3 scripts/feature_smoke.py --screenshots-dir /tmp/httpied-full-review-screenshots
-```
-
-`--review-only` exercises MIME search, Copy URL, context transfer of an unselected saved
-capture, an actual Replay send, response Find selection/clipboard output, and a failed send
-followed by a Raw view switch. Clipboard sentinels prevent an unchanged clipboard from
-passing a selection assertion. The full smoke continues to verify the existing workflow.
-`--screenshots-dir` keeps verification output separate from existing repository screenshots.
-See [the review report](REVIEW_2026-11-02.md) for findings, checks and remaining limits.
+Windows, Wayland/IME, hardware OpenGL, screen-reader operation and extended live CTF sessions
+still require platform/operator validation. See [UX redesign notes](UX_REDESIGN.md) for the exact
+commands/results and [debug logging](DEBUGGING.md) for destination/phase diagnostics.

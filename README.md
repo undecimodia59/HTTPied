@@ -14,15 +14,27 @@ To build from source, install stable Rust and a C/C++ build toolchain, then run:
 cargo run --locked --release --features ui
 ```
 
-Choose **Open project**, **Create project**, or **Temporary project** on the start screen.
+Choose **Open project**, **Create project**, or **Temporary session** on the start screen.
 Temporary projects are deleted on orderly exit. Chromium/Chrome is installed separately;
 **Open browser** launches it with an isolated profile and HTTPied's proxy settings.
 
-The workspace has **Intercept, History, Replay, Intruder, Compare and Settings** tabs.
-Scope, Variables, Browser and Project are Settings subsections. Intruder results appear
+The workspace has **Intercept, History, Replay, Intruder, Compare, Settings and Coder** tabs.
+Scope, Variables, Browser and Files & storage are grouped under Settings. Intruder results appear
 below its request/response editors. Use **Settings → Variables** for key/value pairs and
 write `{{key}}` in Replay's destination or request. See the
 [workflow guide](docs/WORKFLOW.md) for the full controls and limits.
+
+For a CTF: capture traffic in **History**, select a request and press **Ctrl+R** to edit it
+in Replay, then **Ctrl+Enter** to send. History shows executed requests and responses together.
+Session management and less frequent actions are in named menus; message panes and Intruder
+results can be resized by dragging their separators.
+
+Select text with the mouse or **Shift+arrows**, right-click, and choose **Send selection to Coder**.
+Coder (**Ctrl+5**) supports Base64, Base64url, URL percent, form, HTML entities and hex. Binary
+results stay as exact bytes with a hex view; **Use as input** chains a result into another operation.
+Coder data is session-only. In a message editor, **Set Compare baseline** followed by **Compare
+with baseline** opens the paired, highlighted comparison (**Ctrl+6**) with synchronized scrolling.
+You can also paste two messages directly into Compare.
 
 History offers independent Host, Endpoint and Destination columns. Drag header edges to
 resize; widths are saved with the project. Auto response views decode compressed content
@@ -95,3 +107,7 @@ The [2026-11-02 review](docs/REVIEW_2026-11-02.md) records usability fixes and e
 changes. History now offers visible Replay/Intruder transfers, saved-row context actions,
 and matching page counts. Replay response Find supports Next match and Enter. Redacted
 exports also mask URL queries and common API-key headers; redacted cURL masks secret variables.
+
+The [workspace UX redesign](docs/UX_REDESIGN.md) documents the review of every tab, source
+references, removed duplicate controls, validation and screenshots. Recovery commit `eb170e0`
+preserves the workspace before this redesign.

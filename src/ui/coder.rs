@@ -11,14 +11,14 @@ pub(super) struct Coder {
     error: String,
     completed: String,
     codec: Option<Codec>,
-    revision: u64,
+    reset_editor: bool,
 }
 impl Coder {
     pub(super) fn load(&mut self, text: String) {
         self.input = text;
         self.input_hex = false;
         self.clear_output();
-        self.revision += 1;
+        self.reset_editor = true;
     }
     fn clear_output(&mut self) {
         self.output.clear();
@@ -71,9 +71,13 @@ impl Coder {
             self.input_hex = true;
         }
         self.clear_output();
-        self.revision += 1;
+        self.reset_editor = true;
     }
     fn page(&mut self, ui: &mut egui::Ui) {
+        if self.reset_editor {
+            syntax::forget_editor(ui.ctx(), egui::Id::new("coder-input"));
+            self.reset_editor = false;
+        }
         ui.horizontal_wrapped(|ui| {
             ui.heading("Coder");
             ui.weak("Select text in an editor, right-click, then Send selection to Coder.");
@@ -91,7 +95,7 @@ impl Coder {
                 self.codec = Some(codec);
                 self.clear_output();
             }
-            if ui.button("Decode").clicked() {
+            if primary(ui, true, "Decode").clicked() {
                 self.convert(false);
             }
             if ui.button("Encode").clicked() {
@@ -105,7 +109,7 @@ impl Coder {
         if !self.error.is_empty() {
             ui.colored_label(ERROR, &self.error);
         }
-        let height = (ui.available_height() - 100.0).max(100.0);
+        let height = (ui.available_height() - 70.0).max(100.0);
         ui.columns(2, |columns| {
             columns[0].horizontal_wrapped(|ui| {
                 ui.strong("Input");
@@ -116,17 +120,19 @@ impl Coder {
                 }
                 ui.weak(format!("{} characters", self.input.chars().count()));
             });
+            columns[0].weak("Text is UTF-8. Binary results stay as exact hex bytes.");
             egui::ScrollArea::both()
                 .id_salt("coder-input-scroll")
                 .max_height(height)
                 .min_scrolled_height(height)
                 .show(&mut columns[0], |ui| {
-                    if syntax::editor(
+                    if syntax::editor_limited(
                         ui,
-                        egui::Id::new(("coder-input", self.revision)),
+                        egui::Id::new("coder-input"),
                         &mut self.input,
                         true,
                         24,
+                        4 * coder::INPUT_LIMIT,
                     )
                     .changed()
                     {
@@ -212,6 +218,21 @@ impl Spike {
         if let Some(text) = syntax::take_coder_selection(ctx) {
             self.coder.load(text);
             self.workflow.tab = Tab::Coder;
+            ctx.request_repaint();
+        }
+        if let Some(text) =
+            ctx.data_mut(|data| data.remove_temp::<String>(egui::Id::new("compare-baseline")))
+        {
+            self.features.compare_left = text;
+            self.compare_view.editing = true;
+            self.toast = Some(("Compare baseline set".into(), std::time::Instant::now()));
+        }
+        if let Some(text) =
+            ctx.data_mut(|data| data.remove_temp::<String>(egui::Id::new("compare-candidate")))
+        {
+            self.features.compare_right = text;
+            self.compare_view.editing = false;
+            self.workflow.tab = Tab::Compare;
             ctx.request_repaint();
         }
     }

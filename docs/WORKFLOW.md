@@ -1,7 +1,7 @@
 # Workspace workflow
 
 Run `cargo run --locked --release --features ui`, then create/open a project or choose
-Temporary project. The proxy starts after project loading completes. Project directory
+Temporary session. The proxy starts after project loading completes. Project directory
 paths are entered on the start screen. A saved directory contains `project.sqlite`,
 WAL files while open, a lock file and the project's CA files. Two processes cannot open
 the same project for writing. Linux creates new project directories/database/key files
@@ -9,14 +9,50 @@ with owner-only permissions. Variables and traffic are stored locally without en
 Opening older projects upgrades capture metadata to schema 2 for indexed Host/Endpoint
 sorting; executables limited to schema 1 cannot reopen the upgraded database.
 
+## Current CTF workspace
+
+The app opens on History. Select a row to inspect its **Executed request** and **Response**
+side by side. Drag the list/inspector separator or the request/response separator to resize.
+**Send to Replay** (Ctrl+R) is the primary transfer; **More** includes Intruder and comparison
+operations. Other captured byte variants and the unsent scratch draft remain under
+**More → Capture variants & draft**. **View** groups column layout, reload and clear-live-view actions.
+
+Replay has a session strip, a destination/send bar, **Session** management and **Request actions**.
+Copy-as-cURL variants, Content-Length repair, group and timeout controls are in Request actions.
+Response modes use a dropdown; response actions include copying and sending to Compare.
+Ctrl+Enter sends; F9 stops execution. Intruder uses an expandable payload configuration and a
+resizable results pane. The global header owns browser start/stop; Browser settings configure it.
+
+Settings groups Scope, Variables and project files; execution/interception; connection; and
+appearance/shortcuts. Variable secret/enabled/remove controls are under each row's Options menu.
+Project settings separate the import format from JSONL/HAR export choices; project changes autosave.
+
+### Coder and Compare
+
+Select text by dragging or Shift+arrows in a message editor and right-click **Send selection to Coder**.
+Ctrl+5 opens Coder directly. Choose Base64, Base64url, URL percent, URL form (+), HTML entities or
+Hex, then Encode/Decode. URL percent preserves literal `+`; form decoding treats it as a space.
+Base64 decoding accepts whitespace and optional padding. HTML entities require terminating `;`.
+Input is UTF-8 text unless **Interpret as hex bytes** is selected. Decoded binary remains exact bytes
+and defaults to Hex. Copy exports the complete result; previews are limited to 64 KiB of text.
+**Use as input** chains a result when it fits the 128 KiB input budget. Maximum conversion output is
+1 MiB. Coder input/results are cleared when the app exits and are not persisted to the project.
+
+In any message editor, **Set Compare baseline** records the current message; **Compare with baseline**
+records the candidate and opens Compare. Ctrl+6 also opens Compare, where you can paste or edit
+both sides. **Compare inputs** switches to aligned colored results: baseline removals/changes are red,
+candidate additions/changes green. Scrolling is synchronized; Previous/Next change moves through
+changed rows. **Edit inputs**, **Swap sides** and header/hex Options are available in the toolbar.
+Comparison is bounded to 2,048 lines and 256 KiB per side; oversized inputs produce a visible limit.
+
 ## History and Scope
 
 Left-click a row to inspect it. Ctrl-click toggles selection; Shift-click selects a range
-on the current page. Right-click a loaded HTTP capture to send its executed request to
+on the current page. Right-click an HTTP capture to send its executed request to
 Replay or Intruder. A disk-backed row loads its bytes when selected.
 
-**Filters…** opens extension inclusion/exclusion, MIME, method, status prefix,
-minimum duration and minimum size controls. **Columns…** opens a separate ordered column list.
+**Filters** opens extension inclusion/exclusion, MIME, method, status prefix,
+minimum duration and minimum size controls. **View → Choose columns…** opens a separate ordered column list.
 Use `css, js, png` or `(none)` for extensionless paths.
 Filters inspect the path independently from query strings. Save named presets. CONNECT
 and opaque-tunnel rows are hidden by default and can be enabled explicitly.
@@ -27,7 +63,7 @@ includes the parent. Domain matching checks label boundaries and normalizes IDNA
 New entries include subdomains by default: `web-security-academy.net` includes its lab hosts.
 Older display-only rules migrate to this behavior; enforced execution scopes retain their
 existing exact-host boundaries. Uncheck Subdomains for exact-host matching.
-History's **In scope only** applies the current scope immediately, including to saved traffic.
+History's **In scope** applies the current scope immediately, including to saved traffic.
 Editing scope does not hide History entries while this flag is off; there is no Apply button.
 **Restrict Replay and Intruder to scope**
 separately enforces scope on every generated request before any connection.
@@ -46,7 +82,7 @@ excludes response interception waits. CONNECT/TLS setup precedes decrypted reque
 
 Saved History uses 128 metadata rows per page; bodies load on demand. Live retention defaults
 to 128 rows / 16 MiB and is configurable. Evicting or clearing a view does not delete saved
-traffic. Settings → Project has an explicit confirmed purge action. Disk quota failures are visible;
+traffic. Settings → Files & storage has an explicit confirmed purge action. Disk quota failures are visible;
 they do not pretend the capture was saved.
 
 ## Inspect and compare
@@ -59,15 +95,15 @@ messages, direction and close state rather than original frame fragmentation.
 Text previews are capped at 64 KiB. Hex displays at most 8 KiB of source bytes. Find / Next
 match selects occurrences in text views. Line numbers, HTTP/HTML syntax colors, Pretty
 JSON/XML, decoded bodies and parameter/cookie views are display operations. HTML is never
-executed. Decoding supports chunked transfer framing and gzip/deflate/Brotli, with a
+executed. Decoding supports chunked transfer framing and gzip/deflate/Brotli/Zstandard, with a
 2 MiB input and 256 KiB expansion limit. A partial or unsupported encoding shows an error.
 Auto is the default History and Replay/Intruder response view: compressed/chunked bodies
 are decoded for reading, including gzip JavaScript. Captured headers stay visible and a note
 identifies the decoded body. Raw and Hex show the encoded captured bytes. Pretty also decodes
-before formatting. Unsupported encodings (including zstd), binary decoded data, truncated
+before formatting. Unsupported encodings, binary decoded data, truncated
 streams or expansion-limit failures show a decoding message with Raw/Hex still available.
 
-Set Compare left/right from an inspected view, then open Compare. It shows line differences,
+Set a Compare baseline and candidate from a message editor, or paste both inputs directly. Compare shows aligned, highlighted line differences,
 can ignore selected header names and can compare hexadecimal bodies. Comparison is bounded
 to 2,048 lines per side and 256 KiB output. Compared text is a preview, not a full binary-file
 comparison. Intruder results link to their History captures for the same comparison workflow.
@@ -75,7 +111,7 @@ comparison. Intruder results link to their History captures for the same compari
 ## Replay and Variables
 
 Replay has up to eight independently named, grouped and reorderable sessions. Duplicate
-copies the draft. Request options holds a timeout override; 0 uses project settings.
+copies the draft. Request actions holds a timeout override; 0 uses project settings.
 Redirects are not followed automatically. The request/response divider resizes and its
 ratio is saved. Response views include raw, pretty, hex and decoded output.
 The initial response view is Auto; changing views never changes forwarded or saved bytes.
@@ -87,10 +123,10 @@ separate. Send bypasses manual interception. Ctrl+Z / Ctrl+Y are text revisions,
 redo through cursor movement/sends and are bounded to 64 points / 2 MiB per editor.
 
 Drafts, names, groups and timeout overrides are debounced into the project and flushed on
-orderly close. An asterisk indicates a draft differing from its saved snapshot. Closing a
+orderly close. A dot beside the session name indicates a draft differing from its saved snapshot. Closing a
 session removes it from recovery. Stored jobs never restart automatically.
 
-Settings → Variables contains an enabled/key/value/secret table. Use `{{base}}`, `{{token}}`, etc.
+Settings → Variables contains key/value rows; each row’s Options menu controls enabled/secret state. Use `{{base}}`, `{{token}}`, etc.
 in the destination, headers or body. Expansion happens once. Missing/duplicate keys stop
 the send; values are not recursively interpreted. Resolved request preview masks secrets.
 The Secret checkbox masks values in the table; it does not encrypt the project database.
@@ -112,11 +148,11 @@ Cluster bomb forms the product. Prefix/suffix and URL/Base64 transforms are expl
 Plans validate counts/overflow and generate lazily, capped at 1,000,000 requests.
 
 The source shows its payload count; Attack options holds modes, positions and transforms.
-Settings → Execution controls delay,
+Settings → Execution limits controls delay,
 1–16 concurrent executions, global/per-host rates, retries and 429/503 backoff. UI runs use
 one host and apply the stricter global/host rate. Retries are limited to GET/HEAD/OPTIONS,
 at most three, and share the attempt rate gate. No redirects or side-effecting-method retries
-are automatic. Pause stops new dispatch; active requests finish. Cancel/F9 stops active
+are automatic. Pause stops new dispatch; active requests finish. Stop/F9 stops active
 sockets, including when result delivery is backpressured. Stop-on-match is optional.
 
 Results appear below the Intruder editors and persist run/index/payload tuple/status/size/
@@ -129,7 +165,7 @@ retain attribution; a cancellation notification without a dispatched request is 
 
 ## Intercept, rules and HTTPS
 
-Intercept is off initially. Toggle it on, then Forward, Forward without edits, or Drop.
+Intercept is off initially. Toggle it on, then Forward, Discard edits & forward, or Drop.
 Turning off releases held messages without additional manual edits. Holds expire after
 60 seconds; editing is capped at 128 KiB and requires lossless UTF-8. Destination changes
 are rejected.
@@ -182,7 +218,7 @@ connect budget. Error messages distinguish DNS expiry before TCP from a TCP conn
 
 ## Project exchange, Settings and shortcuts
 
-Settings → Project imports JSONL, HAR, raw HTTP or a supported cURL subset. Paste raw/cURL text can load
+Settings → Files & storage imports JSONL, HAR, raw HTTP or a supported cURL subset. Paste raw/cURL text can load
 a Replay draft directly. Imports never run commands, expand local files or send requests.
 Imports are capped at 16 MiB and are atomic; invalid input leaves no partially imported rows.
 History intake pauses while import assigns new IDs.
@@ -228,6 +264,6 @@ Automatic decoding accepts at most 2 MiB captured input, caps every decoded stag
 and displays a 64 KiB text preview. Zstandard's window is capped at 8 MiB. Raw/Hex views remain
 available. HAR export respects encoding headers and does not use display-only magic sniffing.
 
-**Show WS**, next to **In scope only** in History, controls visibility of WebSocket handshakes
+**Show WebSockets**, in History’s Filters dialog, controls visibility of WebSocket handshakes
 and messages. It starts enabled, is saved with the project's filters/presets, and applies to
 live traffic, saved pages and filtered exports. Hiding WS leaves capture and storage running.

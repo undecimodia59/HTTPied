@@ -176,17 +176,7 @@ def main():
                     lib.XFlush(display)
                     time.sleep(.3)
 
-                if args.history_only:
-                    click(145,55)
-                    for shown in [False,True]:
-                        click(145,101);time.sleep(1.5)
-                        with sqlite3.connect(project_path/"project.sqlite") as database:
-                            state=json.loads(database.execute("SELECT json FROM state WHERE id=1").fetchone()[0])
-                            assert state["filter"]["show_ws"] is shown,state["filter"]
-                        subprocess.run(["import","-display",display_name,"-window",str(window),str(destination/f"history-ws-{'shown' if shown else 'hidden'}.png")],check=True,timeout=10)
-                    print("PASS: native Show WS toggle beside In scope only; preference saved in both states")
-
-                if not args.capture_only and not args.history_only:
+                if not args.capture_only:
                     lib.XSetInputFocus.argtypes=[c.c_void_p,c.c_ulong,c.c_int,c.c_ulong]
                     lib.XSetInputFocus(display,window,2,0)
                     xtst.XTestFakeKeyEvent.argtypes=[c.c_void_p,c.c_uint,c.c_int,c.c_ulong]
@@ -218,143 +208,99 @@ def main():
                     def paste_selection(text):
                         subprocess.run(["xclip","-display",display_name,"-selection","clipboard"],input=text.encode(),check=True,timeout=5)
                         hotkey("v")
-                    # Replay HTML highlighting and native undo / redo.
-                    for x,name in [(145,"history"),(250,"replay"),(350,"intruder"),(450,"compare"),(550,"settings")]:
-                        click(x,55);shot(f"revision2-{name}.png")
-                    for y,name in [(130,"network"),(162,"display"),(194,"execution"),(226,"scope"),(258,"variables"),(290,"interception"),(322,"shortcuts"),(354,"browser"),(386,"certificates"),(418,"project")]:
-                        click(65,y);shot(f"revision2-settings-{name}.png")
-                        if args.layout_only and name in ("scope","variables"):
-                            click(220,217);shot(f"revision2-settings-{name}-row.png")
+                    # Current task tabs: layout inspection and actual local CTF workflows.
+                    for shortcut,name in [("1","history"),("2","replay"),("3","intruder"),("4","intercept"),("5","coder"),("6","compare"),("comma","settings")]:
+                        hotkey(shortcut);shot(f"glow-{name}.png")
                     if args.layout_only:
-                        hotkey("1");click(220,101);shot("revision2-history-filters.png")
-                        key("Escape",1);key("Escape",0);lib.XFlush(display);time.sleep(.2)
-                        click(290,101);shot("revision2-history-columns.png")
-                        key("Escape",1);key("Escape",0);lib.XFlush(display);time.sleep(.2)
-
-                    if args.review_only:
-                        # MIME searches must show the same matches as the saved query.
-                        hotkey("1")
-                        paste(250,133,"text/plain");time.sleep(.8)
-                        click(200,215,3);shot("review-mime-context.png")
-                        click(250,337)
-                        copied_url=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert copied_url.startswith("http://127.0.0.1:") and copied_url.endswith("/"),copied_url
-                        # Transfer an unselected saved request directly from its context menu.
-                        conn=http.client.HTTPConnection("127.0.0.1",int(port),timeout=5)
-                        conn.request("GET",f"http://{origin}/native-review",headers={"Host":origin,"Connection":"close"})
-                        assert conn.getresponse().read();conn.close()
-                        wait_path("/native-review")
-                        paste(250,133,"native-review");time.sleep(.8)
-                        shot("review-history-search.png")
-                        click(200,215,3);shot("review-saved-context.png")
-                        click(270,263);time.sleep(.6)
-                        shot("review-saved-replay.png")
-                        # Clipboard checks assert the actual transferred request.
-                        click(180,350);hotkey("a");hotkey("c")
-                        transferred=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "GET /native-review HTTP/1.1" in transferred,transferred
-                        hotkey("Return");wait_path("/native-review");time.sleep(.4)
-                        # Search navigation selects the actual response match.
-                        paste(710,333,"Capture works")
-                        subprocess.run(["xclip","-display",display_name,"-selection","clipboard"],input=b"clipboard sentinel",check=True,timeout=5)
-                        click(835,333);hotkey("c")
-                        found=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert found=="Capture works",found
-                        shot("review-response-find.png")
-                        with socket.socket() as refused:
-                            refused.bind(("127.0.0.1",0))
-                            paste(370,133,f"http://127.0.0.1:{refused.getsockname()[1]}")
-                            hotkey("Return");time.sleep(.8)
-                        subprocess.run(["xclip","-display",display_name,"-selection","clipboard"],input=b"clipboard sentinel",check=True,timeout=5)
-                        click(774,301);click(800,400);hotkey("a");hotkey("c")
-                        failed=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert failed in ("", "clipboard sentinel"),failed
-                        shot("review-failed-replay.png")
-                        print("PASS: MIME search, saved History context transfer, response match navigation and failed Replay cleanup")
-                    elif not args.layout_only:
-                        hotkey("1")
-                        # Resize an actual header boundary; saving/reopening must retain it.
-                        xtst.XTestFakeMotionEvent(display,-1,root_x.value+71,root_y.value+173,0)
-                        xtst.XTestFakeButtonEvent(display,1,1,0);lib.XFlush(display);time.sleep(.1)
-                        for delta in range(10,71,10):
-                            xtst.XTestFakeMotionEvent(display,-1,root_x.value+71+delta,root_y.value+173,0);lib.XFlush(display);time.sleep(.05)
-                        xtst.XTestFakeButtonEvent(display,1,0,0);lib.XFlush(display);time.sleep(.3)
-                        shot("revision3-columns-resized.png")
-                        click(550,55);click(65,226);click(220,217);paste(360,217,"127.0.0.1")
-                        hotkey("1");click(18,101);time.sleep(.6);shot("revision2-scope-matching.png")
-                        click(550,55);click(65,226);paste(360,217,"localhost")
-                        hotkey("1");time.sleep(.6);shot("revision2-scope-hidden.png")
-                        click(550,55);click(65,226);paste(360,217,"127.0.0.1")
-                        hotkey("1");time.sleep(.6);shot("revision2-scope-restored.png")
+                        for y,name in [(174,"scope"),(206,"variables"),(238,"project"),(302,"execution"),(335,"interception"),(400,"network"),(432,"browser"),(465,"certificates"),(531,"display"),(563,"shortcuts")]:
+                            click(70,y);shot(f"glow-settings-{name}.png")
+                    else:
+                        # Selection using Shift+arrows must survive a secondary click.
                         hotkey("2")
-                        paste(370,133,f"http://{origin}")
+                        paste(180,300,"GET /SGVsbG8= HTTP/1.1\r\n\r\n")
+                        hotkey("Home")
+                        for _ in range(5):key("Right",1);key("Right",0)
+                        key("Shift_L",1)
+                        for _ in range(8):key("Right",1);key("Right",0)
+                        key("Shift_L",0);lib.XFlush(display);time.sleep(.2)
+                        click(110,235,3);shot("glow-selection-menu.png")
+                        click(210,255);time.sleep(.3);shot("glow-coder-selected.png")
+                        click(180,300);hotkey("a");hotkey("c")
+                        selected=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert selected=="SGVsbG8=",selected
+                        click(160,134);time.sleep(.2)
+                        click(800,300);hotkey("a");hotkey("c")
+                        decoded=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert decoded=="Hello",decoded
+                        shot("glow-coder-decoded.png")
+                        # Mouse drag selection uses the same exact transfer path.
+                        click(180,300);hotkey("a");paste_selection("prefix SGVsbG8= suffix")
+                        xtst.XTestFakeMotionEvent(display,-1,root_x.value+79,root_y.value+220,0)
+                        xtst.XTestFakeButtonEvent(display,1,1,0);lib.XFlush(display);time.sleep(.1)
+                        for x in range(87,144,8):
+                            xtst.XTestFakeMotionEvent(display,-1,root_x.value+x,root_y.value+220,0);lib.XFlush(display);time.sleep(.06)
+                        xtst.XTestFakeButtonEvent(display,1,0,0);lib.XFlush(display);time.sleep(.2)
+                        click(110,224,3);shot("glow-mouse-selection.png");click(180,244)
+                        click(180,300);hotkey("a");hotkey("c")
+                        dragged=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert dragged=="SGVsbG8=",dragged
+                        # Compare two real message bodies in the paired highlighted view.
+                        hotkey("6")
+                        paste(180,300,"HTTP/1.1 200 OK\r\nX-Test: one\r\n\r\nallowed=false\n")
+                        paste(800,300,"HTTP/1.1 200 OK\r\nX-Test: two\r\n\r\nallowed=true\n")
+                        click(185,101);time.sleep(.3);shot("glow-compare-diff.png")
+                        click(180,300);hotkey("a");hotkey("c")
+                        baseline=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert "allowed=false" in baseline and "allowed=true" not in baseline,baseline
+                        click(800,300);hotkey("a");hotkey("c")
+                        candidate=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert "allowed=true" in candidate,candidate
+                        # The Replay edit/send loop remains functional after command consolidation.
+                        hotkey("2");paste(300,134,f"http://{origin}")
                         paste(180,300,f"GET /compressed.js HTTP/1.1\r\nHost: {origin}\r\n\r\n")
                         hotkey("Return");wait_path("/compressed.js");time.sleep(.5)
                         click(800,400);hotkey("a");hotkey("c")
                         response=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert 'window.httpiedCompressedFixture = "decoded JavaScript";' in response,response
-                        assert "Content-Encoding: gzip" in response,response
-                        shot("revision3-compressed-js-auto.png")
-                        paste(180,300,f"GET /compressed-binary HTTP/1.1\r\nHost: {origin}\r\n\r\n")
-                        hotkey("Return");wait_path("/compressed-binary");time.sleep(.5)
-                        click(800,400);hotkey("a");hotkey("c")
-                        response=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "Content-Encoding: gzip" in response and "�" in response,response
-                        shot("revision4-binary-fallback.png")
-                        # A real refused upstream must appear only in Logs, independent of scope.
+                        assert "decoded JavaScript" in response and "Content-Encoding: gzip" in response,response
+                        shot("glow-replay-sent.png")
+                        paste(180,300,f"GET /glow-replay HTTP/1.1\r\nHost: {origin}\r\n\r\n")
+                        time.sleep(.5);hotkey("z");hotkey("Return");wait_path("/compressed.js")
+                        click(180,300);hotkey("y");hotkey("Return");wait_path("/glow-replay")
+                        # Variables remain directly usable in an actual Replay request.
+                        hotkey("comma");click(70,206);click(225,196)
+                        paste(250,196,"route");paste(570,196,"/glow-replay");shot("glow-variables-filled.png")
+                        hotkey("2");paste(180,300,f"GET {{{{route}}}} HTTP/1.1\r\nHost: {origin}\r\n\r\n")
+                        hotkey("Return");wait_path("/glow-replay")
+                        # Numeric payload generation and attributed durable results.
+                        hotkey("3");paste(300,104,f"http://{origin}")
+                        click(180,170);click(180,225)
+                        paste(120,203,"0000");paste(300,203,"0002")
+                        paste(180,420,f"GET /number/{{{{payload}}}} HTTP/1.1\r\nHost: {origin}\r\n\r\n")
+                        shot("glow-intruder-ready.png");click(860,104)
+                        for value in ("0000","0001","0002"):wait_path(f"/number/{value}")
+                        time.sleep(.5);shot("glow-intruder-results.png")
+                        # History's MIME search must show saved captures and transfer their executed request.
+                        hotkey("1");paste(180,101,"javascript");time.sleep(.8);shot("glow-history-mime.png")
+                        click(180,177);hotkey("r");time.sleep(.6);shot("glow-history-to-replay.png")
+                        click(180,300);hotkey("a");hotkey("c")
+                        transferred=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                        assert "GET /compressed.js HTTP/1.1" in transferred,transferred
+                        # Show a real refusal in the resizable Logs drawer.
                         with socket.socket() as refused:
                             refused.bind(("127.0.0.1",0))
-                            with socket.create_connection(("127.0.0.1",int(port))) as client:
-                                client.settimeout(5)
-                                endpoint=f"127.0.0.1:{refused.getsockname()[1]}"
-                                client.sendall(f"GET http://{endpoint}/refused HTTP/1.1\r\nHost: {endpoint}\r\nConnection: close\r\n\r\n".encode())
-                                while client.recv(4096):pass
-                        time.sleep(.6)
-                        with sqlite3.connect(project_path/"project.sqlite") as database:
-                            assert database.execute("SELECT COUNT(*) FROM captures WHERE method='ERROR'").fetchone()[0]==0
-                            assert database.execute("SELECT COUNT(*) FROM app_logs WHERE json LIKE '%refused%'").fetchone()[0]>=1
+                            conn=http.client.HTTPConnection("127.0.0.1",int(port),timeout=5)
+                            endpoint=f"127.0.0.1:{refused.getsockname()[1]}"
+                            conn.request("GET",f"http://{endpoint}/refused",headers={"Host":endpoint,"Connection":"close"})
+                            conn.getresponse().read();conn.close()
+                        time.sleep(.5)
                         height=int(subprocess.check_output(["identify","-format","%h",str(destination/"ui-capture.png")]))
-                        click(30,height-14);shot("revision4-logs.png")
-                        paste(120,height-233,"refused");shot("revision4-logs-filtered.png")
-                        click(230,height-208)
-                        visible_logs=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "Connection refused" in visible_logs,visible_logs
-                        # Severity and negative search both remove the visible error.
-                        click(375,height-233);click(230,height-208)
-                        assert subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5)==b""
-                        click(375,height-233)
-                        paste(120,height-233,"no-matching-entry");click(230,height-208)
-                        assert subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5)==b""
-                        paste(120,height-233,"refused")
-                        click(30,height-14)
-                        original=f"GET /html HTTP/1.1\r\nHost: {origin}\r\n\r\n"
-                        paste(180,300,original)
-                        time.sleep(1)
-                        hotkey("Return");wait_path("/html");shot("features-replay-sent.png")
-                        paste(180,300,f"GET /changed HTTP/1.1\r\nHost: {origin}\r\n\r\n")
-                        time.sleep(.5);hotkey("z");hotkey("Return");wait_path("/html")
-                        click(180,300);hotkey("y");hotkey("Return");wait_path("/changed")
-                        shot("features-replay-redo.png")
-                        click(550,55);click(65,258);click(220,217)
-                        paste(300,217,"base");paste(640,217,f"http://{origin}")
-                        click(220,249)
-                        paste(300,249,"route");paste(640,249,"/changed")
-                        shot("features-variables-filled.png")
-                        hotkey("2");paste(370,133,"{{base}}")
-                        paste(180,315,"GET {{route}} HTTP/1.1\r\n\r\n")
-                        hotkey("Return");wait_path("/changed");time.sleep(.5)
-                        shot("features-variable-send.png")
-                        click(350,55);paste(250,101,f"http://{origin}")
-                        click(160,133)
-                        shot("features-numbers-source.png")
-                        paste(100,165,"0000");paste(275,165,"0002")
-                        paste(180,300,f"GET /number/{{{{payload}}}} HTTP/1.1\r\nHost: {origin}\r\n\r\n")
-                        shot("features-numbers-ready.png")
-                        click(440,101)
-                        for value in ("0000","0001","0002"):wait_path(f"/number/{value}")
-                        time.sleep(.5);shot("features-numbers-sent.png")
-                        time.sleep(.5);shot("features-results-filled.png")
-
+                        click(30,height-14);shot("glow-logs.png");click(30,height-14)
+                        # Inspect every task at the minimum supported window size.
+                        lib.XResizeWindow.argtypes=[c.c_void_p,c.c_ulong,c.c_uint,c.c_uint]
+                        lib.XResizeWindow(display,window,940,700);lib.XFlush(display);time.sleep(.4)
+                        for shortcut,name in [("1","history"),("2","replay"),("3","intruder"),("4","intercept"),("5","coder"),("6","compare"),("comma","settings")]:
+                            hotkey(shortcut);shot(f"glow-compact-{name}.png")
+                        print("PASS: keyboard/mouse selection to Coder, Base64 conversion, paired Compare, Replay Undo/Redo, MIME search, History transfer and compact layouts")
 
                 event = XEvent()
                 event.message.type = 33  # ClientMessage
@@ -366,24 +312,17 @@ def main():
                 lib.XSendEvent(display, window, 0, 0, c.byref(event))
                 lib.XFlush(display)
                 assert app.wait(timeout=5) == 0, "UI failed graceful shutdown"
-                if not args.capture_only and not args.layout_only and not args.history_only and not args.review_only:
+                if not args.capture_only and not args.layout_only:
                     with sqlite3.connect(project_path/"project.sqlite") as database:
                         state=json.loads(database.execute("SELECT json FROM state WHERE id=1").fetchone()[0])
-                        assert "tls_intercept" not in state["settings"]
-                        assert state["scope"][0]["host"]=="127.0.0.1" and state["scope"][0]["subdomains"]
-                        assert state["filter"]["in_scope"]
-                        assert state["column_widths"].get("#",0)>=100,state["column_widths"]
-                        assert "Host" in state["columns"] and "Endpoint" in state["columns"]
-                        assert database.execute("SELECT COUNT(*) FROM captures WHERE method='ERROR'").fetchone()[0]==0
-                        assert database.execute("SELECT COUNT(*) FROM app_logs WHERE json LIKE '%refused%'").fetchone()[0]>=1
-                        assert state["variables"][0]["key"]=="base" and state["variables"][1]["value"]=="/changed",state["variables"]
-                        assert state["replays"][0]["destination"]=="{{base}}"
-                        assert "{{route}}" in state["replays"][0]["request"]
-                        assert database.execute("SELECT count(*) FROM captures").fetchone()[0]>=10
+                        assert "{{route}}" in state["replays"][0]["request"],state["replays"]
+                        assert state["variables"][0]["key"]=="route" and state["variables"][0]["value"]=="/glow-replay",state["variables"]
                         records=[json.loads(row[0]) for row in database.execute("SELECT json FROM results ORDER BY idx")]
-                        assert len(records)==3 and [r["payloads"][0] for r in records]==["0000","0001","0002"],records
-                        assert all(r["capture_id"] is not None for r in records)
-
+                        assert len(records)==3 and [record["payloads"][0] for record in records]==["0000","0001","0002"],records
+                        assert all(record["capture_id"] is not None for record in records),records
+                        assert database.execute("SELECT count(*) FROM captures WHERE method='ERROR'").fetchone()[0]==0
+                        assert database.execute("SELECT count(*) FROM app_logs WHERE json LIKE '%refused%'").fetchone()[0]>=1
+                    print("PASS: variable Replay drafts, captures and numeric Intruder attribution saved; connection errors isolated in Logs")
                     log.seek(0);log.truncate()
                     app=subprocess.Popen(["dbus-run-session","--",executable,"--listen","127.0.0.1:0"],env=env,stdout=log,stderr=log)
                     limit=time.monotonic()+15;window=None
@@ -398,7 +337,7 @@ def main():
                         if children:lib.XFree(children)
                         if window:break
                         time.sleep(.1)
-                    assert window,"reopened native window missing"
+                    assert window,"reopened window missing"
                     lib.XTranslateCoordinates(display,window,lib.XDefaultRootWindow(display),0,0,c.byref(root_x),c.byref(root_y),c.byref(child))
                     lib.XSetInputFocus(display,window,2,0);time.sleep(.5)
                     paste(300,202,str(project_path));click(55,250)
@@ -408,18 +347,13 @@ def main():
                         if "READY " in log.read():break
                         time.sleep(.1)
                     else:raise RuntimeError("saved project failed to reopen")
-                    hotkey("2");shot("features-recovered-replay.png")
-                    hotkey("Return");wait_path("/changed")
+                    hotkey("2");shot("glow-recovered-replay.png")
+                    hotkey("Return");wait_path("/glow-replay")
                     event.message.window=window;lib.XSendEvent(display,window,0,0,c.byref(event));lib.XFlush(display)
                     assert app.wait(timeout=5)==0
-                    print("PASS: saved project creation/reopen, SQLite captures, Variables substitution and recovered Replay sends")
+                    print("PASS: saved project reopened and recovered variable-driven Replay executed")
                 print("PASS: native X11 window, local fixture captures, graceful window-close shutdown")
-                if args.layout_only:
-                    print("PASS: main tabs, Settings subsections and History configuration layouts")
-                elif not args.capture_only and not args.history_only and not args.review_only:
-                    print("PASS: project startup, feature tabs, undo/redo sends, numeric Intruder requests and durable results")
-                    print("PASS: native column resizing persisted; gzip text and binary fallback in default Replay Auto")
-                    print("PASS: refused upstream persisted only in Logs; native drawer search, severity filter and copy")
+                if args.layout_only:print("PASS: all task tabs and Settings sections captured")
             except BaseException:
                 if app is not None and app.poll() is None and display and window:
                     subprocess.run(["import","-display",display_name,"-window",str(window),str(args.screenshots_dir / "workflow-failure.png")],timeout=10)

@@ -69,8 +69,8 @@ pub(super) struct Features {
     pub(super) pending_transfer: Option<(u64, Tab)>,
     pub export_subset: u8,
     redact: bool,
-    compare_left: String,
-    compare_right: String,
+    pub(super) compare_left: String,
+    pub(super) compare_right: String,
     compare_diff: String,
     search: String,
     search_next: usize,
@@ -79,10 +79,10 @@ pub(super) struct Features {
     pub decoded: bool,
     pub auto_decode: bool,
     pub parameters: bool,
-    ignore_headers: String,
-    compare_hex: bool,
+    pub(super) ignore_headers: String,
+    pub(super) compare_hex: bool,
     results: Vec<crate::jobs::Record>,
-    results_total: u64,
+    pub(super) results_total: u64,
     results_offset: usize,
     results_run: u64,
     results_query: String,
@@ -512,7 +512,7 @@ impl Spike {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.features.path)
                         .char_limit(4096)
-                        .hint_text("Full path to a project folder")
+                        .hint_text("Existing project folder, or a new folder to create")
                         .min_size(egui::vec2(450.0, 20.0))
                         .desired_width(450.0),
                 );
@@ -524,7 +524,7 @@ impl Spike {
                 for (label, create, temporary) in [
                     ("Open project", false, false),
                     ("Create project", true, false),
-                    ("Temporary project", true, true),
+                    ("Temporary session", true, true),
                 ] {
                     if ui.button(label).clicked() {
                         self.features.busy = true;
@@ -539,7 +539,7 @@ impl Spike {
                 }
             });
         });
-        ui.label("Temporary projects are deleted when the app closes. Saved projects keep captures, scope, variables and Replay requests.");
+        ui.label("Saved projects keep traffic, variables and Replay drafts. Temporary sessions are deleted on exit.");
         if self.features.busy {
             ui.spinner();
         }
@@ -547,52 +547,94 @@ impl Spike {
     }
     pub(super) fn history_filters(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut self.features.state.filter.in_scope, "In scope only");
-            ui.checkbox(&mut self.features.state.filter.show_ws, "Show WS")
-                .on_hover_text(
-                    "Show WebSocket handshakes and messages. Capturing continues when hidden.",
-                );
-            if ui.button("Filters…").clicked() {
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("Search method, URL, status or MIME…")
+                    .desired_width((ui.available_width() - 470.0).max(210.0))
+                    .char_limit(512),
+            );
+            if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
+                search.request_focus();
+            }
+            if search.has_focus()
+                && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.filter.clear();
+                search.surrender_focus();
+            }
+            ui.checkbox(&mut self.features.state.filter.in_scope, "In scope");
+            let advanced = &self.features.state.filter;
+            let count = [
+                &advanced.method,
+                &advanced.status,
+                &advanced.mime,
+                &advanced.extensions,
+                &advanced.excluded_extensions,
+            ]
+            .iter()
+            .filter(|value| !value.is_empty())
+            .count()
+                + usize::from(advanced.errors_only)
+                + usize::from(advanced.min_ms > 0.0)
+                + usize::from(advanced.min_bytes > 0)
+                + usize::from(!advanced.show_ws);
+            if ui
+                .button(if count == 0 {
+                    "Filters".into()
+                } else {
+                    format!("Filters ({count})")
+                })
+                .clicked()
+            {
                 self.features.history_dialog = Some(false);
             }
-            if ui.button("Columns…").clicked() {
-                self.features.history_dialog = Some(true);
-            }
-            if ui.button("Refresh").clicked() {
-                self.request_page(0);
-            }
-            if ui
-                .add_enabled(
-                    self.features.offset > 0 && !self.features.busy,
-                    egui::Button::new("Previous"),
-                )
-                .clicked()
-            {
-                self.request_page(self.features.offset.saturating_sub(128));
-            }
-            if ui
-                .add_enabled(
-                    (self.features.offset as u64 + 128) < self.features.matches
-                        && !self.features.busy,
-                    egui::Button::new("Next"),
-                )
-                .clicked()
-            {
-                self.request_page(self.features.offset + 128);
+            ui.menu_button("View", |ui| {
+                if ui.button("Choose columns…").clicked() {
+                    self.features.history_dialog = Some(true);
+                    ui.close();
+                }
+                if ui.button("Reload saved traffic").clicked() {
+                    self.request_page(0);
+                    ui.close();
+                }
+                if ui.button("Clear live view…").clicked() {
+                    self.confirm_clear = !self.history.entries.is_empty();
+                    ui.close();
+                }
+            });
+            if self.features.offset > 0 || self.features.matches > 128 {
+                if ui
+                    .add_enabled(
+                        self.features.offset > 0 && !self.features.busy,
+                        egui::Button::new("Previous"),
+                    )
+                    .clicked()
+                {
+                    self.request_page(self.features.offset.saturating_sub(128));
+                }
+                if ui
+                    .add_enabled(
+                        self.features.offset as u64 + 128 < self.features.matches
+                            && !self.features.busy,
+                        egui::Button::new("Next"),
+                    )
+                    .clicked()
+                {
+                    self.request_page(self.features.offset + 128);
+                }
             }
             if self.features.busy {
                 ui.spinner();
             }
-            let end = (self.features.offset as u64 + 128).min(self.features.matches);
-            if self.features.matches > 0 {
-                ui.label(format!(
-                    "{}–{end} of {} matching · {} saved",
-                    self.features.offset as u64 + 1,
-                    self.features.matches,
-                    self.features.total
+            if self.features.matches > 0 && (self.features.offset as u64) < self.features.matches {
+                ui.weak(format!(
+                    "{}–{} / {}",
+                    self.features.offset + 1,
+                    (self.features.offset as u64 + 128).min(self.features.matches),
+                    self.features.matches
                 ));
             } else {
-                ui.label(format!("0 matching · {} saved", self.features.total));
+                ui.weak(format!("{} matching", self.features.matches));
             }
         });
         self.history_options(ui.ctx());
@@ -705,6 +747,7 @@ impl Spike {
             } else {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.features.state.filter.show_tunnels, "Show CONNECT");
+                    ui.checkbox(&mut self.features.state.filter.show_ws, "Show WebSockets");
                     ui.checkbox(
                         &mut self.features.state.filter.errors_only,
                         "HTTP 4xx / 5xx",
@@ -874,12 +917,11 @@ impl Spike {
             egui::Grid::new("variables-table")
                 .striped(true)
                 .show(ui, |ui| {
-                    for label in ["Enabled", "Key", "Value", "Secret", ""] {
+                    for label in ["Key", "Value", ""] {
                         ui.strong(label);
                     }
                     ui.end_row();
                     for (index, var) in self.features.state.variables.iter_mut().enumerate() {
-                        ui.checkbox(&mut var.enabled, "");
                         ui.add(
                             egui::TextEdit::singleline(&mut var.key)
                                 .min_size(egui::vec2(180.0, 20.0))
@@ -889,14 +931,18 @@ impl Spike {
                         ui.add(
                             egui::TextEdit::singleline(&mut var.value)
                                 .password(var.secret)
-                                .min_size(egui::vec2(420.0, 20.0))
-                                .desired_width(420.0)
+                                .min_size(egui::vec2(260.0, 20.0))
+                                .desired_width(320.0)
                                 .char_limit(65536),
                         );
-                        ui.checkbox(&mut var.secret, "");
-                        if ui.button("Remove").clicked() {
-                            remove = Some(index);
-                        }
+                        ui.menu_button(if var.secret { "Secret" } else { "Options" }, |ui| {
+                            ui.checkbox(&mut var.secret, "Mask as secret");
+                            ui.checkbox(&mut var.enabled, "Use this variable");
+                            if ui.button("Remove variable").clicked() {
+                                remove = Some(index);
+                                ui.close();
+                            }
+                        });
                         ui.end_row();
                     }
                 });
@@ -931,13 +977,18 @@ impl Spike {
             );
         });
         ui.horizontal(|ui| {
-            for format in ["jsonl", "har", "raw", "curl"] {
-                ui.selectable_value(
-                    &mut self.features.transfer_format,
-                    format.to_owned(),
-                    format,
-                );
-            }
+            ui.label("Import format");
+            egui::ComboBox::from_id_salt("project-import-format")
+                .selected_text(&self.features.transfer_format)
+                .show_ui(ui, |ui| {
+                    for format in ["jsonl", "har", "raw", "curl"] {
+                        ui.selectable_value(
+                            &mut self.features.transfer_format,
+                            format.to_owned(),
+                            format,
+                        );
+                    }
+                });
         });
         ui.horizontal(|ui| {
             ui.label("Export");
@@ -954,24 +1005,32 @@ impl Spike {
             "Redact authentication, cookies, URL queries and bodies when exporting",
         );
         ui.horizontal(|ui| {
-            if ui.button("Export captures").clicked() {
-                self.project_command(Command::Export {
-                    path: PathBuf::from(&self.features.transfer_path),
-                    format: self.features.transfer_format.clone(),
-                    redact: self.features.redact,
-                    ids: if self.features.export_subset == 2 {
-                        Some(self.features.selection.iter().copied().collect())
-                    } else {
-                        None
-                    },
-                    filter: if self.features.export_subset == 1 {
-                        Some(self.features.state.filter.clone())
-                    } else {
-                        None
-                    },
-                    scope: self.features.state.scope.clone(),
-                });
-            }
+            ui.menu_button("Export captures", |ui| {
+                for format in ["jsonl", "har"] {
+                    if ui
+                        .button(format!("Export {}", format.to_uppercase()))
+                        .clicked()
+                    {
+                        self.project_command(Command::Export {
+                            path: PathBuf::from(&self.features.transfer_path),
+                            format: format.to_owned(),
+                            redact: self.features.redact,
+                            ids: if self.features.export_subset == 2 {
+                                Some(self.features.selection.iter().copied().collect())
+                            } else {
+                                None
+                            },
+                            filter: if self.features.export_subset == 1 {
+                                Some(self.features.state.filter.clone())
+                            } else {
+                                None
+                            },
+                            scope: self.features.state.scope.clone(),
+                        });
+                        ui.close();
+                    }
+                }
+            });
             if ui
                 .add_enabled(!self.features.importing, egui::Button::new("Import file"))
                 .clicked()
@@ -982,9 +1041,7 @@ impl Spike {
                     format: self.features.transfer_format.clone(),
                 });
             }
-            if ui.button("Save project").clicked() {
-                self.project_command(Command::Save(Box::new(self.features.state.clone())));
-            }
+            ui.weak("Project changes save automatically");
         });
         ui.label("Exports: JSONL / HAR. Imports: JSONL / HAR / raw HTTP / cURL. Original HTTP/2 frames and TLS records cannot be represented in HAR.");
         ui.collapsing("Paste raw request or cURL", |ui| {
@@ -1049,64 +1106,7 @@ impl Spike {
         );
     }
     fn compare(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Compare");
-        ui.horizontal(|ui| {
-            ui.label("Ignore headers");
-            ui.add(egui::TextEdit::singleline(&mut self.features.ignore_headers).char_limit(512));
-            ui.checkbox(&mut self.features.compare_hex, "Hex bodies");
-        });
-        ui.label(format!(
-            "Left: {} · Right: {}",
-            crate::state::size(
-                self.features.compare_left.len() as u64,
-                self.features.state.settings.binary_units
-            ),
-            crate::state::size(
-                self.features.compare_right.len() as u64,
-                self.features.state.settings.binary_units
-            )
-        ));
-        ui.horizontal(|ui| {
-            if ui.button("Selection → left").clicked() {
-                self.features.compare_left = self.text.clone();
-            }
-            if ui.button("Selection → right").clicked() {
-                self.features.compare_right = self.text.clone();
-            }
-            if ui.button("Compare lines").clicked() {
-                self.refresh_comparison();
-            }
-        });
-        ui.columns(2, |cols| {
-            for (index, (col, text)) in cols
-                .iter_mut()
-                .zip([
-                    &mut self.features.compare_left,
-                    &mut self.features.compare_right,
-                ])
-                .enumerate()
-            {
-                egui::ScrollArea::both().max_height(220.0).show(col, |ui| {
-                    syntax::editor_limited(
-                        ui,
-                        egui::Id::new(("compare-side", index)),
-                        text,
-                        true,
-                        10,
-                        262144,
-                    );
-                });
-            }
-        });
-        egui::ScrollArea::both().show(ui, |ui| {
-            syntax::editor(
-                ui,
-                egui::Id::new("compare-diff"),
-                &mut self.features.compare_diff,
-                false,
-                10,
-            );
-        });
+        self.compare_page(ui);
     }
     fn result_filter(&self) -> crate::jobs::ResultFilter {
         crate::jobs::ResultFilter {
@@ -1133,7 +1133,7 @@ impl Spike {
         });
     }
     pub(super) fn results_view(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.strong("Results");
             ui.add(
                 egui::TextEdit::singleline(&mut self.features.results_query)
@@ -1168,25 +1168,27 @@ impl Spike {
                 ui.spinner();
             }
             ui.weak(format!("{} results", self.features.results_total));
-            if ui
-                .add_enabled(
-                    self.features.results_offset > 0,
-                    egui::Button::new("Previous"),
-                )
-                .clicked()
-            {
-                self.features.results_offset = self.features.results_offset.saturating_sub(128);
-                self.features.results_dirty = true;
-            }
-            if ui
-                .add_enabled(
-                    (self.features.results_offset as u64 + 128) < self.features.results_total,
-                    egui::Button::new("Next"),
-                )
-                .clicked()
-            {
-                self.features.results_offset += 128;
-                self.features.results_dirty = true;
+            if self.features.results_total > 128 || self.features.results_offset > 0 {
+                if ui
+                    .add_enabled(
+                        self.features.results_offset > 0,
+                        egui::Button::new("Previous"),
+                    )
+                    .clicked()
+                {
+                    self.features.results_offset = self.features.results_offset.saturating_sub(128);
+                    self.features.results_dirty = true;
+                }
+                if ui
+                    .add_enabled(
+                        (self.features.results_offset as u64 + 128) < self.features.results_total,
+                        egui::Button::new("Next"),
+                    )
+                    .clicked()
+                {
+                    self.features.results_offset += 128;
+                    self.features.results_dirty = true;
+                }
             }
         });
         let mut selected = None;
@@ -1309,6 +1311,21 @@ impl Spike {
         }
     }
     pub(super) fn keyboard_actions(&mut self, ui: &mut egui::Ui) {
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Num5)) {
+            self.workflow.tab = Tab::Coder;
+        }
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Num6)) {
+            self.workflow.tab = Tab::Compare;
+        }
+        if self.workflow.tab == Tab::History {
+            for (key, tab) in [(egui::Key::R, Tab::Replay), (egui::Key::I, Tab::Intruder)] {
+                if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, key))
+                    && let Some(id) = self.selected
+                {
+                    self.transfer_history(id, tab);
+                }
+            }
+        }
         let mut action = None;
         for (name, binding) in &self.features.state.settings.shortcuts {
             if let Some(key) = shortcut(binding)
@@ -1452,7 +1469,7 @@ impl Drop for Spike {
     }
 }
 
-fn shortcut(text: &str) -> Option<egui::KeyboardShortcut> {
+pub(super) fn shortcut(text: &str) -> Option<egui::KeyboardShortcut> {
     if text.trim().is_empty() {
         return None;
     }

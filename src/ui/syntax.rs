@@ -199,8 +199,28 @@ pub(super) fn editor_limited(
         }
     }
     let before = text.clone();
+    let diff_colors = ui
+        .ctx()
+        .data(|data| data.get_temp::<Vec<Color32>>(id.with("diff-colors")));
     let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _width: f32| {
-        let mut job = layout(buf.as_str());
+        let mut job = if let Some(colors) = &diff_colors {
+            let mut job = LayoutJob::default();
+            job.wrap.max_width = f32::INFINITY;
+            for (index, line) in buf.as_str().split_inclusive('\n').enumerate() {
+                job.append(
+                    line,
+                    0.0,
+                    TextFormat {
+                        color: TEXT,
+                        background: colors.get(index).copied().unwrap_or(Color32::TRANSPARENT),
+                        ..Default::default()
+                    },
+                );
+            }
+            job
+        } else {
+            layout(buf.as_str())
+        };
         let font = egui::TextStyle::Monospace.resolve(ui.style());
         for section in &mut job.sections {
             section.format.font_id = font.clone();
@@ -209,12 +229,14 @@ pub(super) fn editor_limited(
     };
     let response = ui
         .horizontal_top(|ui| {
-            let count = text.lines().count().clamp(1, 5000);
-            let numbers = (1..=count)
-                .map(|n| n.to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            ui.label(egui::RichText::new(numbers).monospace().color(PUNCT));
+            if diff_colors.is_none() {
+                let count = text.lines().count().clamp(1, 5000);
+                let numbers = (1..=count)
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.label(egui::RichText::new(numbers).monospace().color(PUNCT));
+            }
             if editable {
                 ui.add(
                     egui::TextEdit::multiline(text)
@@ -328,10 +350,26 @@ fn selection_menu(
         if !available {
             ui.weak("Select text with the mouse or Shift + arrows first.");
         }
+        ui.separator();
+        for (label, action) in [
+            ("Set Compare baseline", "compare-baseline"),
+            ("Compare with baseline", "compare-candidate"),
+        ] {
+            if ui.button(label).clicked() {
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(egui::Id::new(action), text.to_owned()));
+                ui.close();
+            }
+        }
     });
 }
 pub(super) fn take_coder_selection(ctx: &egui::Context) -> Option<String> {
     ctx.data_mut(|data| data.remove_temp::<String>(egui::Id::new("coder-selection")))
+}
+pub(super) fn diff_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, colors: &[Color32]) {
+    ui.ctx()
+        .data_mut(|data| data.insert_temp(id.with("diff-colors"), colors.to_vec()));
+    editor(ui, id, text, false, 30);
 }
 pub fn forget_editor(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|data| {

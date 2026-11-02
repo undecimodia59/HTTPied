@@ -169,7 +169,7 @@ impl Workflow {
         listen: SocketAddr,
     ) -> Self {
         Self {
-            tab: Tab::Intercept,
+            tab: Tab::History,
             trust_ready: false,
             listener_ready: false,
             variables: Vec::new(),
@@ -701,7 +701,7 @@ impl Workflow {
                             .as_secs()
                     ),
                 );
-                if ui.button("Forward").clicked() {
+                if primary(ui, true, "Forward").clicked() {
                     if held.text == held.original {
                         action = Some(Decision::Forward);
                     } else {
@@ -715,7 +715,7 @@ impl Workflow {
                         }
                     }
                 }
-                if ui.button("Forward without edits").clicked() {
+                if held.text != held.original && ui.button("Discard edits & forward").clicked() {
                     action = Some(Decision::Forward);
                 }
                 if ui.button("Drop").clicked() {
@@ -742,11 +742,19 @@ impl Workflow {
                     });
             });
         } else {
-            ui.label(if self.control.enabled() {
-                "Waiting for an HTTP request…"
-            } else {
-                "Interception is off."
-            });
+            empty_state(
+                ui,
+                if self.control.enabled() {
+                    "Waiting for a matching request"
+                } else {
+                    "Traffic is flowing without interception"
+                },
+                if self.control.enabled() {
+                    "Use the browser. Matching requests pause here for editing before they are forwarded."
+                } else {
+                    "Captured traffic is available in History. Turn interception on when you need to pause a request."
+                },
+            );
         }
         if let Some(decision) = action
             && let Some(held) = self.held.pop_front()
@@ -756,7 +764,11 @@ impl Workflow {
         }
     }
     fn tool(&mut self, ui: &mut egui::Ui, tab: Tab) {
-        let active = self.active.is_some();
+        let busy = self.active.is_some();
+        let active = self
+            .active
+            .as_ref()
+            .is_some_and(|(_, owner, _)| *owner == tab);
         let mut send = false;
         let mut cancel = false;
         if active
@@ -777,28 +789,29 @@ impl Workflow {
             ui.add_enabled_ui(!active, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for index in 0..self.replays.len() {
+                        let tool = &self.replays[index];
+                        let title = format!(
+                            "{}{}{}",
+                            if tool.group.is_empty() {
+                                String::new()
+                            } else {
+                                format!("{}/", tool.group)
+                            },
+                            if tool.name == "Request" {
+                                format!("Request {}", index + 1)
+                            } else {
+                                tool.name.clone()
+                            },
+                            if tool.request != tool.baseline
+                                || tool.destination != tool.baseline_destination
+                            {
+                                " •"
+                            } else {
+                                ""
+                            }
+                        );
                         if ui
-                            .selectable_label(
-                                index == self.selected_replay,
-                                format!(
-                                    "{}{} {}{}",
-                                    if self.replays[index].group.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!("{}/", self.replays[index].group)
-                                    },
-                                    self.replays[index].name,
-                                    index + 1,
-                                    if self.replays[index].request != self.replays[index].baseline
-                                        || self.replays[index].destination
-                                            != self.replays[index].baseline_destination
-                                    {
-                                        " *"
-                                    } else {
-                                        ""
-                                    }
-                                ),
-                            )
+                            .selectable_label(index == self.selected_replay, title)
                             .clicked()
                         {
                             self.selected_replay = index;
@@ -811,51 +824,59 @@ impl Workflow {
                         self.replays.push(Tool::new());
                         self.selected_replay = self.replays.len() - 1;
                     }
-                    if ui
-                        .add_enabled(self.replays.len() < 8, egui::Button::new("Duplicate"))
-                        .clicked()
-                    {
-                        let current = &self.replays[self.selected_replay];
-                        let mut copy = Tool::new();
-                        copy.destination = current.destination.clone();
-                        copy.request = current.request.clone();
-                        copy.name = format!("{} copy", current.name);
-                        copy.group = current.group.clone();
-                        copy.timeout_secs = current.timeout_secs;
-                        self.replays.push(copy);
-                        self.selected_replay = self.replays.len() - 1;
-                    }
-                    if ui
-                        .add_enabled(self.selected_replay > 0, egui::Button::new("Left"))
-                        .on_hover_text("Move session left")
-                        .clicked()
-                    {
-                        let i = self.selected_replay;
-                        self.replays.swap(i, i - 1);
-                        self.selected_replay -= 1;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.selected_replay + 1 < self.replays.len(),
-                            egui::Button::new("Right"),
-                        )
-                        .on_hover_text("Move session right")
-                        .clicked()
-                    {
-                        let i = self.selected_replay;
-                        self.replays.swap(i, i + 1);
-                        self.selected_replay += 1;
-                    }
-                    if ui
-                        .add_enabled(self.replays.len() > 1, egui::Button::new("Close request"))
-                        .clicked()
-                    {
-                        let editor = self.replays[self.selected_replay].editor_id;
-                        syntax::forget_editor(ui.ctx(), egui::Id::new(("request", editor)));
-                        syntax::forget_editor(ui.ctx(), egui::Id::new(("response", editor)));
-                        self.replays.remove(self.selected_replay);
-                        self.selected_replay = self.selected_replay.min(self.replays.len() - 1);
-                    }
+                    ui.menu_button("Session", |ui| {
+                        ui.label("Name");
+                        ui.add(
+                            egui::TextEdit::singleline(
+                                &mut self.replays[self.selected_replay].name,
+                            )
+                            .char_limit(64)
+                            .desired_width(180.0),
+                        );
+                        if ui
+                            .add_enabled(
+                                self.replays.len() < 8,
+                                egui::Button::new("Duplicate request"),
+                            )
+                            .clicked()
+                        {
+                            let current = &self.replays[self.selected_replay];
+                            let mut copy = Tool::new();
+                            copy.destination = current.destination.clone();
+                            copy.request = current.request.clone();
+                            copy.name = format!("{} copy", current.name);
+                            copy.group = current.group.clone();
+                            copy.timeout_secs = current.timeout_secs;
+                            self.replays.push(copy);
+                            self.selected_replay = self.replays.len() - 1;
+                            ui.close();
+                        }
+                        for (label, direction) in [("Move left", -1), ("Move right", 1)] {
+                            let next = self.selected_replay.saturating_add_signed(direction);
+                            if ui
+                                .add_enabled(
+                                    next != self.selected_replay && next < self.replays.len(),
+                                    egui::Button::new(label),
+                                )
+                                .clicked()
+                            {
+                                self.replays.swap(self.selected_replay, next);
+                                self.selected_replay = next;
+                                ui.close();
+                            }
+                        }
+                        if ui
+                            .add_enabled(self.replays.len() > 1, egui::Button::new("Close request"))
+                            .clicked()
+                        {
+                            let id = self.replays[self.selected_replay].editor_id;
+                            syntax::forget_editor(ui.ctx(), egui::Id::new(("request", id)));
+                            syntax::forget_editor(ui.ctx(), egui::Id::new(("response", id)));
+                            self.replays.remove(self.selected_replay);
+                            self.selected_replay = self.selected_replay.min(self.replays.len() - 1);
+                            ui.close();
+                        }
+                    });
                 });
             });
         }
@@ -865,313 +886,351 @@ impl Workflow {
             &mut self.intruder
         };
         ui.horizontal_wrapped(|ui| {
-            if tab == Tab::Replay {
-                ui.add(
-                    egui::TextEdit::singleline(&mut tool.name)
-                        .desired_width(110.0)
-                        .char_limit(64),
-                );
-            }
             ui.label("Destination");
             ui.add_enabled(
                 !active,
                 egui::TextEdit::singleline(&mut tool.destination)
-                    .hint_text("http://host:port")
-                    .desired_width(if tab == Tab::Intruder { 280.0 } else { 340.0 })
+                    .hint_text("https://target.example")
+                    .desired_width((ui.available_width() - 200.0).clamp(240.0, 720.0))
                     .char_limit(2048),
             );
-            send = ui
-                .add_enabled(
-                    !active
-                        && !(tab == Tab::Intruder
-                            && self.payload_mode == PayloadMode::File
-                            && self.file_busy),
-                    egui::Button::new(if tab == Tab::Replay {
-                        "Send"
-                    } else {
-                        "Start payloads"
-                    }),
-                )
-                .clicked();
-            cancel = ui
-                .add_enabled(active, egui::Button::new("Cancel"))
-                .clicked();
-            ui.add_enabled_ui(!active, |ui| {
-                ui.checkbox(&mut tool.repair, "Update Content-Length");
-            });
+            send = primary(
+                ui,
+                !busy
+                    && !(tab == Tab::Intruder
+                        && self.payload_mode == PayloadMode::File
+                        && self.file_busy),
+                if tab == Tab::Replay {
+                    "Send  Ctrl+Enter"
+                } else {
+                    "Start attack"
+                },
+            )
+            .clicked();
+            if active {
+                cancel = ui.button("Stop").clicked();
+            }
         });
         if tab == Tab::Intruder {
-            ui.add_enabled_ui(!active, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Payloads");
-                    ui.selectable_value(&mut self.payload_mode, PayloadMode::Text, "Text");
-                    ui.selectable_value(&mut self.payload_mode, PayloadMode::Numbers, "Numbers");
-                    ui.selectable_value(&mut self.payload_mode, PayloadMode::File, "Wordlist");
-                    ui.selectable_value(
-                        &mut self.payload_mode,
-                        PayloadMode::Charset,
-                        "Character set",
-                    );
-                    ui.selectable_value(
-                        &mut self.payload_mode,
-                        PayloadMode::Random,
-                        "Seeded random",
-                    );
-                    ui.menu_button("Attack options", |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.selectable_value(
-                                &mut self.attack_mode,
-                                crate::attack::Mode::Sniper,
-                                "Sniper",
-                            );
-                            ui.selectable_value(
-                                &mut self.attack_mode,
-                                crate::attack::Mode::Pitchfork,
-                                "Pitchfork",
-                            );
-                            ui.selectable_value(
-                                &mut self.attack_mode,
-                                crate::attack::Mode::ClusterBomb,
-                                "Cluster bomb",
-                            );
-                            ui.label("Positions");
-                            ui.add(egui::DragValue::new(&mut self.positions).range(1..=4));
-                            ui.selectable_value(
-                                &mut self.encoding,
-                                crate::attack::Encoding::None,
-                                "Raw",
-                            );
-                            ui.selectable_value(
-                                &mut self.encoding,
-                                crate::attack::Encoding::Url,
-                                "URL",
-                            );
-                            ui.selectable_value(
-                                &mut self.encoding,
-                                crate::attack::Encoding::Base64,
-                                "Base64",
-                            );
-                        });
-                        ui.collapsing("Additional sets and transforms", |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label("Prefix");
-                                ui.text_edit_singleline(&mut self.prefix);
-                                ui.label("Suffix");
-                                ui.text_edit_singleline(&mut self.suffix);
-                            });
-                            for slot in 1..self.positions {
-                                ui.label(format!(
+            egui::CollapsingHeader::new("Payload configuration")
+                .default_open(true)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("payload-config-scroll")
+                        .max_height(210.0)
+                        .show(ui, |ui| {
+                            ui.add_enabled_ui(!active, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label("Payload source");
+                                    egui::ComboBox::from_id_salt("payload-source")
+                                        .selected_text(match self.payload_mode {
+                                            PayloadMode::Text => "Text",
+                                            PayloadMode::Numbers => "Numbers",
+                                            PayloadMode::File => "Wordlist",
+                                            PayloadMode::Charset => "Character set",
+                                            PayloadMode::Random => "Seeded random",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for (mode, label) in [
+                                                (PayloadMode::Text, "Text"),
+                                                (PayloadMode::Numbers, "Numbers"),
+                                                (PayloadMode::File, "Wordlist"),
+                                                (PayloadMode::Charset, "Character set"),
+                                                (PayloadMode::Random, "Seeded random"),
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.payload_mode,
+                                                    mode,
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                    ui.menu_button("Attack options", |ui| {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.selectable_value(
+                                                &mut self.attack_mode,
+                                                crate::attack::Mode::Sniper,
+                                                "Sniper",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.attack_mode,
+                                                crate::attack::Mode::Pitchfork,
+                                                "Pitchfork",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.attack_mode,
+                                                crate::attack::Mode::ClusterBomb,
+                                                "Cluster bomb",
+                                            );
+                                            ui.label("Positions");
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.positions)
+                                                    .range(1..=4),
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.encoding,
+                                                crate::attack::Encoding::None,
+                                                "Raw",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.encoding,
+                                                crate::attack::Encoding::Url,
+                                                "URL",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.encoding,
+                                                crate::attack::Encoding::Base64,
+                                                "Base64",
+                                            );
+                                        });
+                                        ui.collapsing("Additional sets and transforms", |ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.label("Prefix");
+                                                ui.text_edit_singleline(&mut self.prefix);
+                                                ui.label("Suffix");
+                                                ui.text_edit_singleline(&mut self.suffix);
+                                            });
+                                            for slot in 1..self.positions {
+                                                ui.label(format!(
                                     "{{{{payload{}}}}} · one per line; empty uses primary set",
                                     slot + 1
                                 ));
-                                ui.add(
-                                    egui::TextEdit::multiline(&mut self.extra_payloads[slot - 1])
-                                        .char_limit(16384)
-                                        .desired_rows(2),
-                                );
-                            }
-                            ui.label("Sniper defaults for inactive positions");
-                            for slot in 0..self.positions {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!("Position {}", slot + 1));
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.defaults[slot])
-                                            .char_limit(4096),
+                                                ui.add(
+                                                    egui::TextEdit::multiline(
+                                                        &mut self.extra_payloads[slot - 1],
+                                                    )
+                                                    .char_limit(16384)
+                                                    .desired_rows(2),
+                                                );
+                                            }
+                                            ui.label("Sniper defaults for inactive positions");
+                                            for slot in 0..self.positions {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(format!("Position {}", slot + 1));
+                                                    ui.add(
+                                                        egui::TextEdit::singleline(
+                                                            &mut self.defaults[slot],
+                                                        )
+                                                        .char_limit(4096),
+                                                    );
+                                                });
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label("Response contains");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.matcher)
+                                                    .char_limit(256),
+                                            );
+                                            ui.checkbox(&mut self.stop_on_match, "Stop on match");
+                                        });
+                                    });
+                                    ui.label("{{payload}}").on_hover_text(
+                                        "Use {{payload}}, {{payload2}}, etc. in the request",
                                     );
                                 });
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Response contains");
-                            ui.add(egui::TextEdit::singleline(&mut self.matcher).char_limit(256));
-                            ui.checkbox(&mut self.stop_on_match, "Stop on match");
-                        });
-                    });
-                    ui.label("{{payload}}")
-                        .on_hover_text("Use {{payload}}, {{payload2}}, etc. in the request");
-                });
-                match self.payload_mode {
-                    PayloadMode::Charset | PayloadMode::Random => {
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label("Alphabet");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.alphabet)
-                                    .char_limit(1024)
-                                    .desired_width(220.0),
-                            );
-                            ui.label("Length");
-                            ui.add(egui::DragValue::new(&mut self.generated_width).range(1..=256));
-                            if self.payload_mode == PayloadMode::Random {
-                                ui.label("Count");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.generated_count)
-                                        .range(1..=1000000),
-                                );
-                                ui.label("Seed");
-                                ui.add(egui::DragValue::new(&mut self.generated_seed));
-                            }
-                        });
-                    }
-                    PayloadMode::Text => {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.payloads)
-                                .hint_text("One payload per line")
-                                .char_limit(16 * 1024)
-                                .desired_rows(3),
-                        );
-                    }
-                    PayloadMode::Numbers => {
-                        ui.horizontal(|ui| {
-                            ui.label("From");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.number_start)
-                                    .desired_width(130.0)
-                                    .char_limit(20),
-                            );
-                            ui.label("To");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.number_end)
-                                    .desired_width(130.0)
-                                    .char_limit(20),
-                            );
-                            ui.label("Step");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.number_step)
-                                    .desired_width(60.0)
-                                    .char_limit(20),
-                            );
-                        });
-                        match crate::payload::Payloads::numbers(
-                            &self.number_start,
-                            &self.number_end,
-                            &self.number_step,
-                        ) {
-                            Ok(mut source) => {
-                                let count = source.len();
-                                ui.label(format!(
+                                match self.payload_mode {
+                                    PayloadMode::Charset | PayloadMode::Random => {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label("Alphabet");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.alphabet)
+                                                    .char_limit(1024)
+                                                    .desired_width(220.0),
+                                            );
+                                            ui.label("Length");
+                                            ui.add(
+                                                egui::DragValue::new(&mut self.generated_width)
+                                                    .range(1..=256),
+                                            );
+                                            if self.payload_mode == PayloadMode::Random {
+                                                ui.label("Count");
+                                                ui.add(
+                                                    egui::DragValue::new(&mut self.generated_count)
+                                                        .range(1..=1000000),
+                                                );
+                                                ui.label("Seed");
+                                                ui.add(egui::DragValue::new(
+                                                    &mut self.generated_seed,
+                                                ));
+                                            }
+                                        });
+                                    }
+                                    PayloadMode::Text => {
+                                        ui.add(
+                                            egui::TextEdit::multiline(&mut self.payloads)
+                                                .hint_text("One payload per line")
+                                                .char_limit(16 * 1024)
+                                                .desired_rows(3),
+                                        );
+                                    }
+                                    PayloadMode::Numbers => {
+                                        ui.horizontal(|ui| {
+                                            ui.label("From");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.number_start)
+                                                    .desired_width(130.0)
+                                                    .char_limit(20),
+                                            );
+                                            ui.label("To");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.number_end)
+                                                    .desired_width(130.0)
+                                                    .char_limit(20),
+                                            );
+                                            ui.label("Step");
+                                            ui.add(
+                                                egui::TextEdit::singleline(&mut self.number_step)
+                                                    .desired_width(60.0)
+                                                    .char_limit(20),
+                                            );
+                                        });
+                                        match crate::payload::Payloads::numbers(
+                                            &self.number_start,
+                                            &self.number_end,
+                                            &self.number_step,
+                                        ) {
+                                            Ok(mut source) => {
+                                                let count = source.len();
+                                                ui.label(format!(
                                     "{count} payloads; first: {} (leading zeros preserved)",
                                     source.next().unwrap_or_default()
                                 ));
+                                            }
+                                            Err(error) => {
+                                                ui.colored_label(ERROR, error.to_string());
+                                            }
+                                        }
+                                    }
+                                    PayloadMode::File => {
+                                        ui.horizontal(|ui| {
+                                            if ui
+                                                .add_enabled(
+                                                    !self.file_busy,
+                                                    egui::TextEdit::singleline(&mut self.file_path)
+                                                        .hint_text("Wordlist path")
+                                                        .desired_width(450.0)
+                                                        .char_limit(4096),
+                                                )
+                                                .changed()
+                                            {
+                                                self.file_values = None;
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !self.file_busy,
+                                                    egui::Button::new("Browse…"),
+                                                )
+                                                .clicked()
+                                            {
+                                                match self
+                                                    .file_worker
+                                                    .commands
+                                                    .try_send(crate::payload::FileAction::Browse)
+                                                {
+                                                    Ok(()) => self.file_busy = true,
+                                                    Err(error) => self.message = error.to_string(),
+                                                }
+                                            }
+                                            if ui
+                                                .add_enabled(
+                                                    !self.file_busy,
+                                                    egui::Button::new("Load"),
+                                                )
+                                                .clicked()
+                                            {
+                                                match self.file_worker.commands.try_send(
+                                                    crate::payload::FileAction::Load(
+                                                        self.file_path.clone().into(),
+                                                    ),
+                                                ) {
+                                                    Ok(()) => self.file_busy = true,
+                                                    Err(error) => self.message = error.to_string(),
+                                                }
+                                            }
+                                        });
+                                        if self.file_busy {
+                                            ui.label("Loading wordlist…");
+                                        } else if let Some(values) = &self.file_values {
+                                            ui.label(format!("{} payloads loaded", values.len()));
+                                        }
+                                    }
+                                }
+                            });
+                        });
+                });
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.menu_button("Request actions", |ui| {
+                if tab == Tab::Replay {
+                    for (label, redacted) in
+                        [("Copy as cURL", false), ("Copy as cURL (redacted)", true)]
+                    {
+                        if ui.button(label).clicked() {
+                            match tool.curl(&self.variables, redacted) {
+                                Ok(command) => ui.ctx().copy_text(command),
+                                Err(error) => self.message = error,
+                            }
+                            ui.close();
+                        }
+                    }
+                }
+                ui.separator();
+                ui.checkbox(&mut tool.repair, "Update Content-Length when sending");
+                ui.label("Group");
+                ui.add(
+                    egui::TextEdit::singleline(&mut tool.group)
+                        .char_limit(64)
+                        .desired_width(180.0),
+                );
+                ui.label("Timeout (0 uses Settings)");
+                ui.add(
+                    egui::DragValue::new(&mut tool.timeout_secs)
+                        .range(0..=86400)
+                        .suffix(" s"),
+                );
+                if tab == Tab::Replay {
+                    ui.collapsing("Resolved preview", |ui| {
+                        let mut masked = self.variables.clone();
+                        for var in &mut masked {
+                            if var.secret {
+                                var.value = "[REDACTED]".into();
+                            }
+                        }
+                        match crate::state::resolve(&tool.destination, &masked).and_then(
+                            |destination| {
+                                crate::state::resolve(&tool.request, &masked)
+                                    .map(|request| format!("{destination}\n{request}"))
+                            },
+                        ) {
+                            Ok(text) => {
+                                ui.monospace(text);
                             }
                             Err(error) => {
-                                ui.colored_label(ERROR, error.to_string());
+                                ui.colored_label(ERROR, error);
                             }
                         }
-                    }
-                    PayloadMode::File => {
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    !self.file_busy,
-                                    egui::TextEdit::singleline(&mut self.file_path)
-                                        .hint_text("Wordlist path")
-                                        .desired_width(450.0)
-                                        .char_limit(4096),
-                                )
-                                .changed()
-                            {
-                                self.file_values = None;
-                            }
-                            if ui
-                                .add_enabled(!self.file_busy, egui::Button::new("Browse…"))
-                                .clicked()
-                            {
-                                match self
-                                    .file_worker
-                                    .commands
-                                    .try_send(crate::payload::FileAction::Browse)
-                                {
-                                    Ok(()) => self.file_busy = true,
-                                    Err(error) => self.message = error.to_string(),
-                                }
-                            }
-                            if ui
-                                .add_enabled(!self.file_busy, egui::Button::new("Load"))
-                                .clicked()
-                            {
-                                match self.file_worker.commands.try_send(
-                                    crate::payload::FileAction::Load(self.file_path.clone().into()),
-                                ) {
-                                    Ok(()) => self.file_busy = true,
-                                    Err(error) => self.message = error.to_string(),
-                                }
-                            }
-                        });
-                        if self.file_busy {
-                            ui.label("Loading wordlist…");
-                        } else if let Some(values) = &self.file_values {
-                            ui.label(format!("{} payloads loaded", values.len()));
-                        }
-                    }
+                    });
                 }
             });
-        }
-        if tab == Tab::Replay {
-            ui.horizontal(|ui| {
-                if ui.button("Copy as cURL (redacted)").clicked() {
-                    let result = tool.curl(&self.variables, true);
-                    match result {
-                        Ok(command) => ui.ctx().copy_text(command),
-                        Err(error) => self.message = error,
-                    }
-                }
-                if ui.button("Copy as cURL").clicked() {
-                    let result = tool.curl(&self.variables, false);
-                    match result {
-                        Ok(command) => ui.ctx().copy_text(command),
-                        Err(error) => self.message = error,
-                    }
-                }
-            });
-            ui.collapsing("Resolved request preview", |ui| {
-                let mut masked = self.variables.clone();
-                for var in &mut masked {
-                    if var.secret {
-                        var.value = "[REDACTED]".into();
-                    }
-                }
-                match crate::state::resolve(&tool.destination, &masked).and_then(|destination| {
-                    crate::state::resolve(&tool.request, &masked)
-                        .map(|request| format!("{destination}\n{request}"))
-                }) {
-                    Ok(text) => {
-                        ui.monospace(text);
-                    }
-                    Err(error) => {
-                        ui.colored_label(ERROR, error);
-                    }
-                }
-            });
-        }
-        if tab == Tab::Replay {
-            ui.horizontal(|ui| {
-                ui.menu_button("Request options", |ui| {
-                    ui.label("Group");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut tool.group)
-                            .char_limit(64)
-                            .min_size(egui::vec2(160.0, 20.0)),
-                    );
-                    ui.label("Timeout (seconds; 0 uses Settings)");
-                    ui.add(egui::DragValue::new(&mut tool.timeout_secs).range(0..=86400));
-                    ui.label("Redirects are not followed automatically.");
-                });
-            });
-        }
-        ui.horizontal(|ui| {
-            ui.label(&tool.status);
+            ui.weak(&tool.status);
             if let Some(count) = planned {
-                ui.weak(format!("{count} requests"));
+                ui.weak(format!("{count} planned requests"));
             }
         });
         let width = ui.available_width();
-        let height = (ui.available_height() - 16.0).max(90.0);
+        let height = (ui.available_height() - 75.0).max(90.0);
+        resize_split_with_window(ui, egui::Id::new(("request-split", tool.editor_id)), width);
         let left = egui::Panel::left(egui::Id::new(("request-split", tool.editor_id)))
+            .frame(egui::Frame::NONE)
             .resizable(true)
             .default_size(width * self.settings.request_ratio)
             .size_range(210.0..=(width - 210.0).max(210.0))
             .show(ui, |ui| {
-                ui.strong("Request");
+                ui.horizontal(|ui| {
+                    ui.set_min_height(27.0);
+                    ui.strong("Request");
+                });
                 egui::ScrollArea::both()
                     .id_salt(("tool-request", tool.editor_id))
                     .max_height(height)
@@ -1187,77 +1246,107 @@ impl Workflow {
                     });
             });
         self.settings.request_ratio = (left.response.rect.width() / width).clamp(0.15, 0.85);
-        egui::CentralPanel::default().show(ui, |ui| {
-            let mut response_jump = None;
-            ui.horizontal_wrapped(|ui| {
-                ui.strong("Response");
-                let previous = tool.response_mode;
-                for (mode, label) in [
-                    (4, "Auto"),
-                    (0, "Raw"),
-                    (1, "Pretty"),
-                    (2, "Hex"),
-                    (3, "Decoded"),
-                ] {
-                    ui.selectable_value(&mut tool.response_mode, mode, label);
-                }
-                if previous != tool.response_mode {
-                    tool.response = tool.response_view();
-                }
-            });
-            if let Some(note) = &tool.response_note {
-                ui.weak(note);
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Find");
-                let search = ui.add(
-                    egui::TextEdit::singleline(&mut tool.response_find)
-                        .desired_width(120.0)
-                        .char_limit(256),
-                );
-                if search.changed() {
-                    tool.response_search_next = 0;
-                }
-                let next = ui
-                    .add_enabled(
-                        !tool.response_find.is_empty(),
-                        egui::Button::new("Next match"),
-                    )
-                    .clicked()
-                    || (search.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                if next {
-                    response_jump = syntax::find_next(
-                        ui,
-                        egui::Id::new(("response", tool.editor_id)),
-                        &tool.response,
-                        &tool.response_find,
-                        &mut tool.response_search_next,
-                    );
-                }
-                if !tool.response_find.is_empty() {
-                    ui.label(format!(
-                        "{} matches",
-                        tool.response.matches(&tool.response_find).count()
-                    ));
-                }
-            });
-            let mut area = egui::ScrollArea::both().id_salt(("tool-response", tool.editor_id));
-            if let Some(line) = response_jump {
-                area = area.vertical_scroll_offset(line as f32 * (self.settings.font_size + 3.0));
-            }
-            area.max_height(height)
-                .min_scrolled_height(height)
-                .show(ui, |ui| {
-                    syntax::editor(
-                        ui,
-                        egui::Id::new(("response", tool.editor_id)),
-                        &mut tool.response,
-                        false,
-                        25,
-                    );
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ui, |ui| {
+                let mut response_jump = None;
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong("Response");
+                    let previous = tool.response_mode;
+                    egui::ComboBox::from_id_salt(("response-mode", tool.editor_id))
+                        .selected_text(match tool.response_mode {
+                            0 => "Raw",
+                            1 => "Pretty",
+                            2 => "Hex",
+                            3 => "Decoded",
+                            _ => "Auto",
+                        })
+                        .show_ui(ui, |ui| {
+                            for (mode, label) in [
+                                (4, "Auto"),
+                                (0, "Raw"),
+                                (1, "Pretty"),
+                                (2, "Hex"),
+                                (3, "Decoded"),
+                            ] {
+                                ui.selectable_value(&mut tool.response_mode, mode, label);
+                            }
+                        });
+                    ui.menu_button("Response actions", |ui| {
+                        if ui.button("Copy response view").clicked() {
+                            ui.ctx().copy_text(tool.response.clone());
+                            ui.close();
+                        }
+                        for (label, id) in [
+                            ("Set Compare baseline", "compare-baseline"),
+                            ("Compare with baseline", "compare-candidate"),
+                        ] {
+                            if ui.button(label).clicked() {
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(egui::Id::new(id), tool.response.clone())
+                                });
+                                ui.close();
+                            }
+                        }
+                    });
+                    if previous != tool.response_mode {
+                        tool.response = tool.response_view();
+                    }
                 });
-        });
+                if let Some(note) = &tool.response_note {
+                    ui.weak(note);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Find");
+                    let search = ui.add(
+                        egui::TextEdit::singleline(&mut tool.response_find)
+                            .desired_width(120.0)
+                            .char_limit(256),
+                    );
+                    if search.changed() {
+                        tool.response_search_next = 0;
+                    }
+                    let next = ui
+                        .add_enabled(
+                            !tool.response_find.is_empty(),
+                            egui::Button::new("Next match"),
+                        )
+                        .clicked()
+                        || (search.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                    if next {
+                        response_jump = syntax::find_next(
+                            ui,
+                            egui::Id::new(("response", tool.editor_id)),
+                            &tool.response,
+                            &tool.response_find,
+                            &mut tool.response_search_next,
+                        );
+                    }
+                    if !tool.response_find.is_empty() {
+                        ui.label(format!(
+                            "{} matches",
+                            tool.response.matches(&tool.response_find).count()
+                        ));
+                    }
+                });
+                let mut area = egui::ScrollArea::both().id_salt(("tool-response", tool.editor_id));
+                if let Some(line) = response_jump {
+                    area =
+                        area.vertical_scroll_offset(line as f32 * (self.settings.font_size + 3.0));
+                }
+                area.max_height(height)
+                    .min_scrolled_height(height)
+                    .show(ui, |ui| {
+                        syntax::editor(
+                            ui,
+                            egui::Id::new(("response", tool.editor_id)),
+                            &mut tool.response,
+                            false,
+                            25,
+                        );
+                    });
+            });
         if send {
             self.start_job(tab);
         }
@@ -1273,7 +1362,7 @@ impl Workflow {
                 egui::TextEdit::singleline(&mut self.settings.browser)
                     .hint_text("Auto-detect Chromium / Chrome, or enter its full executable path")
                     .char_limit(2048)
-                    .desired_width(650.0),
+                    .desired_width((ui.available_width() - 110.0).max(240.0)),
             );
         });
         ui.horizontal(|ui| {
@@ -1281,28 +1370,10 @@ impl Workflow {
             ui.add(
                 egui::TextEdit::singleline(&mut self.settings.browser_url)
                     .char_limit(2048)
-                    .desired_width(650.0),
+                    .desired_width((ui.available_width() - 110.0).max(240.0)),
             );
         });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.trust_ready && self.listener_ready,
-                    egui::Button::new("Launch browser"),
-                )
-                .on_disabled_hover_text(
-                    "Waiting for the proxy listener and HTTPS certificate setup. See Certificates.",
-                )
-                .clicked()
-            {
-                self.launch_browser();
-            }
-            if ui.button("Stop browser").clicked()
-                && let Some(tx) = &self.browser_tx
-            {
-                let _ = tx.try_send(browser::Action::Stop);
-            }
-        });
+        ui.weak("Use Open browser in the application header to start the isolated browser.");
         ui.label(&self.browser_status);
         ui.label(format!("Proxy: http://{}", self.listen));
         ui.label(if self.trust_ready {
@@ -1346,28 +1417,19 @@ impl Spike {
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new("HTTPied").size(17.0).strong());
             muted(ui, &self.status);
-            if let Some((_, _, cancel)) = &self.workflow.active
-                && ui.button("Stop execution").clicked()
-            {
-                cancel.send_replace(true);
+            if let Some((_,tab,_)) = &self.workflow.active {
+                let tab=*tab;
+                if ui.link("Execution running →").clicked(){self.workflow.tab=tab;}
             }
-
-            if !self.workflow.held.is_empty() {
-                badge(
-                    ui,
-                    &format!(
-                        "{} request(s) waiting in Intercept",
-                        self.workflow.held.len()
-                    ),
-                    WARN,
-                );
-            }
-
+            if !self.workflow.held.is_empty() { ui.colored_label(WARN,format!("{} held",self.workflow.held.len())); }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
+                let browser_running=self.workflow.browser_status.starts_with("Browser started")||self.workflow.browser_status.starts_with("Browser already running");
+                if browser_running {
+                    if ui.button("Stop browser").clicked()&&let Some(tx)=&self.workflow.browser_tx{let _=tx.try_send(browser::Action::Stop);}
+                } else if ui
                     .add_enabled(
                         self.workflow.trust_ready && self.workflow.listener_ready,
-                        egui::Button::new("Open browser"),
+                        egui::Button::new("Open browser").fill(egui::Color32::from_rgb(46,99,172)),
                     )
                     .on_disabled_hover_text("Waiting for the proxy listener and HTTPS certificate setup. See Settings / Certificates.")
                     .clicked()
@@ -1380,14 +1442,11 @@ impl Spike {
             for (tab, label) in [
                 (
                     Tab::Intercept,
-                    format!(
-                        "Intercept  {}",
-                        if self.workflow.control.enabled() {
-                            "ON"
-                        } else {
-                            "OFF"
-                        }
-                    ),
+                    if self.workflow.held.is_empty() {
+                        "Intercept".into()
+                    } else {
+                        format!("Intercept ({})", self.workflow.held.len())
+                    },
                 ),
                 (
                     Tab::History,
@@ -1420,20 +1479,18 @@ impl Spike {
             }
             Tab::Intruder => {
                 let height = ui.available_height();
-                let results_height = (height * 0.34).clamp(190.0, 260.0);
-                ui.allocate_ui_with_layout(
-                    egui::vec2(
-                        ui.available_width(),
-                        (height - results_height - 12.0).max(230.0),
-                    ),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        self.workflow.tool(ui, Tab::Intruder);
-                    },
-                );
+                egui::Panel::bottom("intruder-result-panel")
+                    .resizable(true)
+                    .default_size(240.0)
+                    .min_size(if self.features.results_total > 0 {
+                        200.0
+                    } else {
+                        120.0
+                    })
+                    .max_size((height * 0.55).max(150.0))
+                    .show(ui, |ui| self.results_view(ui));
+                self.workflow.tool(ui, Tab::Intruder);
                 self.features.state.settings.request_ratio = self.workflow.settings.request_ratio;
-                ui.separator();
-                self.results_view(ui);
             }
             _ => self.feature_tab(ui),
         }

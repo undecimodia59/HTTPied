@@ -13,25 +13,58 @@ fn field(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
 }
 impl Spike {
     pub(super) fn settings_page(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
         egui::Panel::left("settings-sections")
-            .exact_size(155.0)
+            .exact_size(170.0)
             .resizable(false)
             .show(ui, |ui| {
-                for (section, label) in [
-                    (SettingsSection::General, "Network"),
-                    (SettingsSection::Display, "Display & storage"),
-                    (SettingsSection::Execution, "Execution"),
-                    (SettingsSection::Scope, "Scope"),
-                    (SettingsSection::Variables, "Variables"),
-                    (SettingsSection::Interception, "Interception"),
-                    (SettingsSection::Shortcuts, "Shortcuts"),
-                    (SettingsSection::Browser, "Browser"),
-                    (SettingsSection::Certificates, "Certificates"),
-                    (SettingsSection::Project, "Project"),
-                ] {
-                    ui.selectable_value(&mut self.features.settings_section, section, label);
-                }
+                ui.strong("Settings");
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-navigation")
+                    .show(ui, |ui| {
+                        for (title, sections) in [
+                            (
+                                "Project",
+                                vec![
+                                    (SettingsSection::Scope, "Scope"),
+                                    (SettingsSection::Variables, "Variables"),
+                                    (SettingsSection::Project, "Files & storage"),
+                                ],
+                            ),
+                            (
+                                "Traffic",
+                                vec![
+                                    (SettingsSection::Execution, "Execution limits"),
+                                    (SettingsSection::Interception, "Intercept & rewrite"),
+                                ],
+                            ),
+                            (
+                                "Connection",
+                                vec![
+                                    (SettingsSection::General, "Network"),
+                                    (SettingsSection::Browser, "Browser"),
+                                    (SettingsSection::Certificates, "Certificates"),
+                                ],
+                            ),
+                            (
+                                "Application",
+                                vec![
+                                    (SettingsSection::Display, "Appearance"),
+                                    (SettingsSection::Shortcuts, "Shortcuts"),
+                                ],
+                            ),
+                        ] {
+                            ui.add_space(8.0);
+                            ui.weak(title);
+                            for (section, label) in sections {
+                                ui.selectable_value(
+                                    &mut self.features.settings_section,
+                                    section,
+                                    label,
+                                );
+                            }
+                        }
+                    });
             });
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
@@ -264,10 +297,27 @@ impl Spike {
                     field(ui, action, binding, "Ctrl+1, Ctrl+Enter, F9");
                 }
             });
+        let mut seen = Vec::new();
+        for (action, binding) in &self.features.state.settings.shortcuts {
+            if binding.trim().is_empty() {
+                continue;
+            }
+            match super::features::shortcut(binding) {
+                None => {
+                    ui.colored_label(ERROR, format!("{action}: invalid shortcut '{binding}'"));
+                }
+                Some(key) => {
+                    if let Some((other, _)) = seen.iter().find(|(_, used)| *used == key) {
+                        ui.colored_label(WARN, format!("{action} and {other} share {binding}"));
+                    }
+                    seen.push((action, key));
+                }
+            }
+        }
         if ui.button("Restore defaults").clicked() {
             self.features.state.settings.shortcuts = crate::state::Settings::default().shortcuts;
         }
-        ui.weak("Ctrl+Z / Ctrl+Y: undo / redo. Ctrl+F: History search.");
+        ui.weak("Ctrl+Z / Ctrl+Y: undo / redo. Ctrl+F: History search. Ctrl+R / Ctrl+I: send selected History request. Ctrl+5: Coder. Ctrl+6: Compare.");
     }
     fn certificate_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("Certificates");

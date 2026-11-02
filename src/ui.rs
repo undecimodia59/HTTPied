@@ -5,7 +5,9 @@ use crate::{
 };
 use eframe::egui;
 mod coder;
+mod compare;
 mod features;
+mod history;
 mod log_view;
 mod settings;
 mod syntax;
@@ -493,6 +495,8 @@ enum SortColumn {
 }
 struct Spike {
     coder: coder::Coder,
+    compare_view: compare::CompareView,
+    inspect: history::Inspector,
     workflow: Workflow,
     features: features::Features,
     rx: mpsc::Receiver<Event>,
@@ -522,6 +526,8 @@ impl Spike {
         Self {
             rx,
             coder: Default::default(),
+            compare_view: Default::default(),
+            inspect: Default::default(),
             features: features::Features::new(),
             workflow: Workflow::offline(listen),
             history: History::new(RETAINED_BYTES, RETAINED_ROWS),
@@ -867,28 +873,6 @@ impl Spike {
                 }
             });
         }
-        let search = ui
-            .horizontal(|ui| {
-                let response = ui.add_sized(
-                    [(ui.available_width() - 100.0).max(200.0), 28.0],
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Search History")
-                        .char_limit(512),
-                );
-                if ui.button("Clear view").clicked() {
-                    self.confirm_clear = !self.history.entries.is_empty();
-                }
-                response
-            })
-            .inner;
-        if ui.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::F)) {
-            search.request_focus();
-        }
-        if search.has_focus()
-            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-        {
-            search.surrender_focus();
-        }
         if !ui.ctx().egui_wants_keyboard_input() {
             if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
                 self.move_selection(1);
@@ -899,6 +883,10 @@ impl Spike {
         }
         let mut clicked = None;
         let mut send_to = None;
+        let list_max = (ui.available_height() - 260.0).max(140.0);
+        let list_min = (70.0 + 35.0 * self.visible_ids().len().min(4) as f32).clamp(130.0, 210.0);
+        egui::Panel::top("history-list").resizable(true).default_size(220.0).min_size(list_min).max_size(list_max).show(ui,|ui| {
+        let rows_height=(ui.available_height()-52.0).max(70.0);
         card().show(ui, |ui| {
             let width = ui.available_width();
             let layout = column_layout(
@@ -992,7 +980,7 @@ impl Spike {
                     }
                     ui.separator();
                     let ids = self.visible_ids();
-                    let height = (ui.available_height() * 0.36).clamp(110.0, 250.0);
+                    let height = rows_height;
                     let mut area = egui::ScrollArea::vertical()
                         .id_salt("history-rows")
                         .min_scrolled_height(height)
@@ -1073,6 +1061,7 @@ impl Spike {
                     }
                 });
         });
+        });
         if let Some((id, modifiers)) = clicked {
             if modifiers.shift {
                 let ids = self.visible_ids();
@@ -1099,18 +1088,9 @@ impl Spike {
         if let Some((id, tab)) = send_to {
             self.transfer_history(id, tab);
         }
-        muted(
-            ui,
-            format!(
-                "{} of {} entries; {} evicted",
-                self.visible_ids().len(),
-                self.history.entries.len(),
-                self.history.evicted
-            ),
-        );
         self.inspector(ui);
     }
-    fn inspector(&mut self, ui: &mut egui::Ui) {
+    fn single_inspector(&mut self, ui: &mut egui::Ui) {
         if self.reset_draft_undo {
             syntax::forget_editor(ui.ctx(), egui::Id::new("history-draft"));
             self.reset_draft_undo = false;

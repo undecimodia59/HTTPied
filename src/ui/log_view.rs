@@ -128,19 +128,21 @@ impl Spike {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.log_view.query)
                             .hint_text("Search logs")
-                            .desired_width(180.0)
+                            .desired_width((ui.available_width() - 260.0).clamp(180.0, 620.0))
                             .char_limit(256),
                     );
-                    for (index, label) in ["Info", "Warnings", "Errors"].iter().enumerate() {
-                        ui.checkbox(&mut self.log_view.levels[index], *label);
-                    }
-                    if ui.small_button("Clear").clicked() {
-                        self.logs.records.clear();
-                        self.project_command(crate::project::Command::ClearLogs);
-                    }
-                    if ui.small_button("Close").clicked() {
-                        self.log_view.open = false;
-                    }
+                    ui.menu_button("Levels", |ui| {
+                        for (index, label) in ["Info", "Warnings", "Errors"].iter().enumerate() {
+                            ui.checkbox(&mut self.log_view.levels[index], *label);
+                        }
+                    });
+                    ui.menu_button("Actions", |ui| {
+                        if ui.button("Clear logs").clicked() {
+                            self.logs.records.clear();
+                            self.project_command(crate::project::Command::ClearLogs);
+                            ui.close();
+                        }
+                    });
                 });
                 let query = self.log_view.query.to_lowercase();
                 let records: Vec<_> = self

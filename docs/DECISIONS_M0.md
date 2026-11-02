@@ -288,3 +288,23 @@ Reported EOF/reset logs lack destination/phase context. Enrich TLS, HTTPS and We
 errors while preserving failure semantics, certificate verification and truncation checks.
 The supplied excerpts cannot prove whether cancellation, peer behavior or a defect caused
 any individual failure. Do not globally suppress or downgrade these failures.
+
+
+## ADR-033 — Native CTF workspace redesign (2026-11-02)
+
+The operator prioritizes a review of every UI surface, permits broad changes, and requests a
+recovery commit followed by a separate redesign commit. Recovery is `eb170e0`. Use documented
+Caido/Burp interaction patterns and desktop UI guidance, with sources and the full surface
+inventory in `docs/UX_REDESIGN.md`.
+
+Retain egui and the existing data/transport boundaries. Reduce competing toolbars through named
+secondary menus; keep execution, scope and cancellation explicit. History defaults to paired
+request/response panes and a resizable list. Replay keeps one send bar and compact sessions;
+Intruder separates expandable payload configuration from resizable results. Compare uses
+bounded aligned text results, color-coded lines, synchronized scrolling and change navigation.
+Message editor context actions supply comparison sources. Coder remains byte preserving and
+session-only. Settings are grouped; browser lifecycle has one global action surface. Adapt
+saved pane widths proportionally when window size changes rather than squeezing one editor.
+
+Do not claim a full Burp/Caido feature set, causal commercial-success research or cross-platform
+runtime qualification. Preserve all existing protocol limitations and verification policies.
