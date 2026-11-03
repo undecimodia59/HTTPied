@@ -25,6 +25,7 @@ pub(super) enum Tab {
     History,
     Replay,
     Intruder,
+    Attack,
     Settings,
     Compare,
     Coder,
@@ -160,6 +161,7 @@ pub(super) struct Workflow {
     jobs: mpsc::Sender<Job>,
     results: mpsc::Receiver<ResultEvent>,
     active: Option<(u64, Tab, watch::Sender<bool>)>,
+    pub(super) external_active: bool,
     next_job: u64,
     browser_tx: Option<std::sync::mpsc::SyncSender<browser::Action>>,
     browser_rx: Option<std::sync::mpsc::Receiver<String>>,
@@ -219,6 +221,7 @@ impl Workflow {
             jobs,
             results,
             active: None,
+            external_active: false,
             next_job: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -265,6 +268,9 @@ impl Workflow {
                 tool.baseline_destination = tool.destination.clone();
             }
         }
+    }
+    pub(super) fn is_running(&self) -> bool {
+        self.active.is_some()
     }
     pub(super) fn stop(&self) {
         if let Some((_, _, cancel)) = &self.active {
@@ -490,6 +496,7 @@ impl Workflow {
             tool.group = self.replays[self.selected_replay].group.clone();
             self.replays.push(tool);
             self.selected_replay = self.replays.len() - 1;
+            self.replay_selection.clear();
         }
         let tool = if tab == Tab::Replay {
             &mut self.replays[self.selected_replay]
@@ -563,6 +570,13 @@ impl Workflow {
         Ok(plan)
     }
     pub(super) fn start_job(&mut self, tab: Tab) {
+        if self.external_active {
+            self.message =
+                "An Attack experiment is running. Stop it before starting another execution."
+                    .into();
+            return;
+        }
+
         if tab == Tab::Intruder && self.payload_mode == PayloadMode::File && self.file_busy {
             self.message = "Wait for the wordlist to finish loading.".into();
             return;
@@ -1346,6 +1360,7 @@ impl Workflow {
 }
 impl Spike {
     pub(super) fn workflow_content(&mut self, ui: &mut egui::Ui) {
+        self.workflow.external_active = self.attack.running();
         if !self.features.importing && self.features.pending.len() < 16 {
             for event in self.workflow.poll() {
                 self.receive(event);
@@ -1410,6 +1425,7 @@ impl Spike {
                 ),
                 (Tab::Replay, "Replay".into()),
                 (Tab::Intruder, "Intruder".into()),
+                (Tab::Attack, "Attack".into()),
                 (Tab::Compare, "Compare".into()),
                 (Tab::Coder, "Coder".into()),
                 (Tab::Settings, "Settings".into()),
@@ -1429,6 +1445,7 @@ impl Spike {
         match self.workflow.tab {
             Tab::Intercept => self.workflow.intercept(ui),
             Tab::History => self.workspace(ui),
+            Tab::Attack => self.attack_page(ui),
             Tab::Replay => {
                 self.workflow.tool(ui, Tab::Replay);
                 self.features.state.settings.request_ratio = self.workflow.settings.request_ratio;

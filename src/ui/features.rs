@@ -169,8 +169,27 @@ impl Spike {
         };
         if entry.loaded {
             if let Event::Exchange(execution) = &entry.event {
-                self.workflow
-                    .load_result(crate::replay::executed_request(execution), tab);
+                if tab == Tab::Attack {
+                    let transfer = crate::replay::executed_request(execution)
+                        .and_then(|wire| crate::replay::origin_draft(&wire))
+                        .map_err(|e| e.to_string())
+                        .and_then(|(destination, request)| {
+                            self.attack.load(vec![crate::state::SavedRequest {
+                                name: "Request".into(),
+                                group: String::new(),
+                                timeout_secs: 0,
+                                destination,
+                                request,
+                            }])
+                        });
+                    match transfer {
+                        Ok(()) => self.workflow.tab = Tab::Attack,
+                        Err(error) => self.workflow.message = error,
+                    }
+                } else {
+                    self.workflow
+                        .load_result(crate::replay::executed_request(execution), tab);
+                }
                 if tab == Tab::Intruder && self.workflow.message.is_empty() {
                     self.features.result_inspection = None;
                 }
@@ -187,8 +206,27 @@ impl Spike {
         {
             self.features.pending_transfer = None;
             if let Event::Exchange(execution) = event {
-                self.workflow
-                    .load_result(crate::replay::executed_request(execution), tab);
+                if tab == Tab::Attack {
+                    let transfer = crate::replay::executed_request(execution)
+                        .and_then(|wire| crate::replay::origin_draft(&wire))
+                        .map_err(|e| e.to_string())
+                        .and_then(|(destination, request)| {
+                            self.attack.load(vec![crate::state::SavedRequest {
+                                name: "Request".into(),
+                                group: String::new(),
+                                timeout_secs: 0,
+                                destination,
+                                request,
+                            }])
+                        });
+                    match transfer {
+                        Ok(()) => self.workflow.tab = Tab::Attack,
+                        Err(error) => self.workflow.message = error,
+                    }
+                } else {
+                    self.workflow
+                        .load_result(crate::replay::executed_request(execution), tab);
+                }
                 if tab == Tab::Intruder && self.workflow.message.is_empty() {
                     self.features.result_inspection = None;
                 }
@@ -223,6 +261,25 @@ impl Spike {
                 break;
             };
             match reply {
+                Reply::CampaignComparison { original, modified } => {
+                    if let (Event::Exchange(original), Event::Exchange(modified)) =
+                        (*original, *modified)
+                    {
+                        self.features.compare_left =
+                            crate::exchange::auto_preview(&original.response).text;
+                        self.features.compare_right =
+                            crate::exchange::auto_preview(&modified.response).text;
+                        self.compare_view.editing = false;
+                        self.workflow.tab = Tab::Compare;
+                    }
+                }
+                Reply::CampaignList(runs) => self.attack.runs = runs,
+                Reply::CampaignLoad {
+                    run,
+                    rows,
+                    total,
+                    offset,
+                } => self.attack.loaded(*run, rows, total, offset),
                 Reply::Opened {
                     path,
                     temporary,
@@ -266,6 +323,8 @@ impl Spike {
                     self.history.row_limit = self.features.state.settings.retain_rows;
                     self.replace_page(rows);
                     self.workflow.restore(&self.features.state);
+                    self.attack.workspace = self.features.state.attack_workspace.clone();
+                    self.project_command(Command::CampaignList);
                     self.install_trust();
                     if let Some(policy) = &self.features.policy {
                         policy.send_replace(std::sync::Arc::new(crate::policy::Policy::from(
@@ -459,6 +518,7 @@ impl Spike {
             // Replay recovery is debounced, including edits made outside Settings.
             self.features.state.replays = self.workflow.saved_requests();
             self.workflow.save_group_state(&mut self.features.state);
+            self.features.state.attack_workspace = self.attack.workspace.clone();
             let snapshot = serde_json::to_string(&self.features.state).unwrap_or_default();
             if snapshot != self.features.saved {
                 if let Some(policy) = &self.features.policy {
@@ -1102,7 +1162,16 @@ impl Spike {
         });
         ui.label("Export creates a new file. Existing files are never overwritten.");
         ui.separator();
-        if ui.button("Purge project captures and results…").clicked() {
+        if ui
+            .add_enabled(
+                !self.workflow.is_running() && !self.attack.running(),
+                egui::Button::new("Purge project captures and results…"),
+            )
+            .on_disabled_hover_text(
+                "Stop the current execution before purging its saved captures and results.",
+            )
+            .clicked()
+        {
             self.features.purge = true;
         }
         if self.features.purge {
@@ -1117,6 +1186,10 @@ impl Spike {
                     self.features.total = 0;
                     self.clear();
                     self.features.results.clear();
+                    self.attack.records.clear();
+                    self.attack.runs.clear();
+                    self.attack.total = 0;
+                    self.attack.loaded_run = None;
                 }
                 if ui.button("Keep captures").clicked() {
                     self.features.purge = false;
@@ -1294,6 +1367,10 @@ impl Spike {
         }
     }
     pub(super) fn keyboard_actions(&mut self, ui: &mut egui::Ui) {
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Num7)) {
+            self.workflow.tab = Tab::Attack;
+        }
+
         if ui.input_mut(|input| input.consume_key(egui::Modifiers::CTRL, egui::Key::Num5)) {
             self.workflow.tab = Tab::Coder;
         }
@@ -1326,7 +1403,10 @@ impl Spike {
                 "Intercept" => self.workflow.tab = Tab::Intercept,
                 "Settings" => self.workflow.tab = Tab::Settings,
                 "Send" if self.workflow.tab == Tab::Replay => self.workflow.start_job(Tab::Replay),
-                "Stop" => self.workflow.stop(),
+                "Stop" => {
+                    self.workflow.stop();
+                    self.attack.stop();
+                }
                 _ => {}
             }
         }
@@ -1438,9 +1518,18 @@ impl Spike {
 
 impl Drop for Spike {
     fn drop(&mut self) {
+        self.attack.stop();
         if self.features.open {
+            if let Some(id) = self.attack.active_run() {
+                self.features.pending.push_back(Command::CampaignFinish {
+                    id,
+                    status: "Interrupted by application exit".into(),
+                });
+            }
+
             self.features.state.replays = self.workflow.saved_requests();
             self.workflow.save_group_state(&mut self.features.state);
+            self.features.state.attack_workspace = self.attack.workspace.clone();
             if self.features.state.settings.validate().is_ok() {
                 self.features
                     .pending

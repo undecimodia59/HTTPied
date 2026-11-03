@@ -4,10 +4,12 @@ use crate::{
     proxy::{self, Config},
 };
 use eframe::egui;
+mod attacks;
 mod coder;
 mod compare;
 mod features;
 mod history;
+mod jwt;
 mod log_view;
 mod results;
 mod settings;
@@ -43,6 +45,8 @@ pub fn run(
     config.policy = Some(policy_rx);
     let (job_tx, job_rx) = mpsc::channel(2);
     let (result_tx, result_rx) = mpsc::channel(2);
+    let (attack_tx, attack_jobs) = mpsc::channel(1);
+    let (attack_updates, attack_results) = mpsc::channel(2);
     let mut browser = crate::browser::Service::start();
     let browser_tx = browser.commands.clone();
     let browser_rx = browser.messages.take().unwrap();
@@ -85,7 +89,10 @@ pub fn run(
                 config.clone(),
                 stop_rx.clone(),
             ));
+            let attacks = tokio::spawn(crate::campaign::run(attack_jobs, attack_updates, config.clone(), stop_rx.clone()));
             let result = proxy::serve(listener, config, tx, stop_rx).await;
+            attacks.abort();
+            let _ = attacks.await;
             jobs.abort();
             let _ = jobs.await;
             if let Err(error) = &result {
@@ -110,6 +117,8 @@ pub fn run(
             let mut app = Spike::new(rx, configured);
             app.workflow = Workflow::new(control, pending_rx, job_tx, result_rx, configured);
             app.workflow.set_browser(browser_tx, browser_rx);
+            app.attack.sender = Some(attack_tx);
+            app.attack.receiver = Some(attack_results);
             app.features.startup = Some(startup_tx);
             app.features.policy = Some(policy_tx);
             Ok(Box::new(app))
@@ -496,6 +505,7 @@ enum SortColumn {
 }
 struct Spike {
     coder: coder::Coder,
+    attack: attacks::Attack,
     compare_view: compare::CompareView,
     inspect: history::Inspector,
     workflow: Workflow,
@@ -527,6 +537,7 @@ impl Spike {
         Self {
             rx,
             coder: Default::default(),
+            attack: Default::default(),
             compare_view: Default::default(),
             inspect: Default::default(),
             features: features::Features::new(),
@@ -1034,6 +1045,7 @@ impl Spike {
                                         send_to = Some((entry.id, Tab::Intruder));
                                         ui.close();
                                     }
+                                    if ui.button("Send to Attack").clicked() {send_to=Some((entry.id,Tab::Attack));ui.close();}
                                     if ui.button("Copy URL").clicked() {
                                         ui.ctx().copy_text(execution.parsed.target.clone());
                                         self.toast =
@@ -1263,6 +1275,7 @@ impl Spike {
 impl eframe::App for Spike {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         self.poll_project();
+        self.poll_attack();
         for _ in 0..8 {
             if self.features.importing || self.features.pending.len() >= 16 {
                 break;
@@ -1490,6 +1503,7 @@ mod tests {
             Tab::History,
             Tab::Replay,
             Tab::Intruder,
+            Tab::Attack,
         ] {
             app.workflow.tab = tab;
             let input = egui::RawInput {

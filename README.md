@@ -18,7 +18,7 @@ Choose **Open project**, **Create project**, or **Temporary session** on the sta
 Temporary projects are deleted on orderly exit. Chromium/Chrome is installed separately;
 **Open browser** launches it with an isolated profile and HTTPied's proxy settings.
 
-The workspace has **Intercept, History, Replay, Intruder, Compare, Coder and Settings** tabs.
+The workspace has **Intercept, History, Replay, Intruder, Attack, Compare, Coder and Settings** tabs.
 Scope, Variables, Browser and Files & storage are grouped under Settings. Intruder results appear
 below its request/response editors. Use **Settings → Variables** for key/value pairs and
 write `{{key}}` in Replay's destination or request.
@@ -27,6 +27,35 @@ For a CTF: capture traffic in **History**, select a request and press **Ctrl+R**
 in Replay, then **Ctrl+Enter** to send. History shows executed requests and responses together.
 Session management and less frequent actions are in named menus; message panes and Intruder
 results can be resized by dragging their separators.
+
+Replay has a searchable sidebar with named, collapsible groups. Create a group with **+**, move
+requests through the Session menu or drag them onto a group, and use Ctrl/Shift to select several
+requests. Names, groups, order, drafts and the selected request survive reopening. Replay supports
+64 requests; **Send selection to Attack** and the group's context menu hand off request snapshots.
+Group execution happens in **Attack**, not in Replay.
+
+**Attack (Ctrl+7)** offers three experiment modes. **Race condition** repeats one request or cycles
+through several inputs, with configurable bursts, parallel connections, delay and timeout. Its
+HTTP/1.1 synchronization prepares all connections before releasing each request's final byte;
+HTTP/2 single-packet sending is not implemented. Client release timings do not measure simultaneous
+server processing. Project rate limits apply; synchronized sending reports conflicting limits.
+**Access-control** sends a fresh original baseline and variants with alternate credential headers
+and optional anonymous checks. Set headers directly or reference project variables. Matching
+successful bodies are potential bypasses requiring review; HTTP denial statuses and a configured
+denial marker help classify results. Anonymous checks strip configured credential headers,
+including Authorization and Cookie; credentials in URLs or bodies require manual changes.
+**Sequence** runs requests in order, extracts JSON pointers, response headers, cookies or regex
+captures into `{{variables}}`, and optionally carries cookies on the same origin. Expected status
+prefixes and required extractors can stop dependent steps. Each cycle starts with fresh runtime
+variables and cookies. Experiments support 32 inputs, 4,096 attempts and 64 parallel connections.
+Runs do not retry automatically or apply proxy rewrite rules. Saved runs retain their plans,
+outcomes, result pages and links to captured messages. Click any result to inspect its exact request
+and response; Access-control variants can open Compare against their original response.
+
+Coder includes a **JWT workbench** for local header/claims inspection, expiry hints, explicit
+HS256/HS384/HS512 signing and verification, and unsigned `alg=none` test tokens. Selected valid JWTs
+open it automatically. Editing claims builds a new token; decoding alone does not verify a signature.
+JWT inputs, output and signing keys are session-only.
 
 Select text with the mouse or **Shift+arrows**, right-click, and choose **Send selection to Coder**.
 Coder (**Ctrl+5**) supports Base64, Base64url, URL percent, form, HTML entities and hex. Binary
@@ -86,6 +115,7 @@ cargo test --locked --release --all-features
 cargo check --locked --no-default-features
 cargo build --locked --release --features ui
 python3 scripts/feature_smoke.py
+python3 scripts/feature_smoke.py --attack-only
 python3 scripts/trust_smoke.py
 ```
 

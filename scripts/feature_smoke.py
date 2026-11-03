@@ -33,17 +33,31 @@ class XEvent(c.Union):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--capture-only", action="store_true")
+    parser.add_argument("--attack-only", action="store_true")
+    parser.add_argument("--jwt-only", action="store_true")
     parser.add_argument("--layout-only",action="store_true")
     parser.add_argument("--history-only",action="store_true")
     parser.add_argument("--review-only", action="store_true", help="check History search, saved actions and failed Replay views")
     parser.add_argument("--screenshots-dir", type=Path, default=Path("docs/screenshots"))
     args = parser.parse_args()
+    args.attack_only = args.attack_only or args.jwt_only
     executable=os.environ.get("HTTPIED_TEST_BINARY","target/release/httpied")
     observed=queue.Queue()
     class Tracked(Fixture):
         def do_GET(self):
             observed.put((self.path,self.headers.get("User-Agent","")))
-            if self.path=="/compressed.js":
+            if self.path=="/native-login":
+                body=b'{"token":"fresh-native"}'
+                self.send_response(200);self.send_header("Content-Type","application/json");self.send_header("Set-Cookie","session=fresh-native; Path=/; HttpOnly");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+            elif self.path=="/native-use/fresh-native":
+                valid="session=fresh-native" in self.headers.get("Cookie","") and self.headers.get("X-CSRF")=="fresh-native"
+                body=b'sequence-completed' if valid else b'credentials-missing'
+                self.send_response(200 if valid else 403);self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+            elif self.path=="/native-access":
+                valid=self.headers.get("Authorization")=="Bearer high"
+                body=b'protected-resource' if valid else b'access-denied'
+                self.send_response(200 if valid else 403);self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+            elif self.path=="/compressed.js":
                 body=gzip.compress(b'window.httpiedCompressedFixture = "decoded JavaScript";\n',mtime=0)
                 self.send_response(200);self.send_header("Content-Type","application/javascript; charset=utf-8");self.send_header("Content-Encoding","gzip");self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
             elif self.path=="/compressed-binary":
@@ -208,134 +222,137 @@ def main():
                     def paste_selection(text):
                         subprocess.run(["xclip","-display",display_name,"-selection","clipboard"],input=text.encode(),check=True,timeout=5)
                         hotkey("v")
-                    # Current task tabs: layout inspection and actual local CTF workflows.
-                    for shortcut,name in [("1","history"),("2","replay"),("3","intruder"),("4","intercept"),("5","coder"),("6","compare"),("comma","settings")]:
-                        hotkey(shortcut);shot(f"glow-{name}.png")
-                    if args.layout_only:
-                        for y,name in [(174,"scope"),(206,"variables"),(238,"project"),(302,"execution"),(335,"interception"),(400,"network"),(432,"browser"),(465,"certificates"),(531,"display"),(563,"shortcuts")]:
-                            click(70,y);shot(f"glow-settings-{name}.png")
+                    if args.attack_only:
+                        from attack_smoke import exercise
+                        exercise(click,paste,shot,hotkey,key,wait_path,origin,project_path,display_name,jwt_only=args.jwt_only)
                     else:
-                        # Selection using Shift+arrows must survive a secondary click.
-                        hotkey("2")
-                        paste(180,300,"GET /SGVsbG8= HTTP/1.1\r\n\r\n")
-                        hotkey("Home")
-                        for _ in range(5):key("Right",1);key("Right",0)
-                        key("Shift_L",1)
-                        for _ in range(8):key("Right",1);key("Right",0)
-                        key("Shift_L",0);lib.XFlush(display);time.sleep(.2)
-                        click(110,235,3);shot("glow-selection-menu.png")
-                        click(210,334);time.sleep(.3);shot("glow-coder-selected.png")
-                        click(180,300);hotkey("a");hotkey("c")
-                        selected=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert selected=="SGVsbG8=",selected
-                        click(160,134);time.sleep(.2)
-                        click(800,300);hotkey("a");hotkey("c")
-                        decoded=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert decoded=="Hello",decoded
-                        shot("glow-coder-decoded.png")
-                        # Mouse drag selection uses the same exact transfer path.
-                        click(180,300);hotkey("a");paste_selection("prefix SGVsbG8= suffix")
-                        xtst.XTestFakeMotionEvent(display,-1,root_x.value+79,root_y.value+220,0)
-                        xtst.XTestFakeButtonEvent(display,1,1,0);lib.XFlush(display);time.sleep(.1)
-                        for x in range(87,144,8):
-                            xtst.XTestFakeMotionEvent(display,-1,root_x.value+x,root_y.value+220,0);lib.XFlush(display);time.sleep(.06)
-                        xtst.XTestFakeButtonEvent(display,1,0,0);lib.XFlush(display);time.sleep(.2)
-                        click(110,224,3);shot("glow-mouse-selection.png");click(180,244)
-                        click(180,300);hotkey("a");hotkey("c")
-                        dragged=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert dragged=="SGVsbG8=",dragged
-                        # Compare two real message bodies in the paired highlighted view.
-                        hotkey("6")
-                        paste(180,300,"HTTP/1.1 200 OK\r\nX-Test: one\r\n\r\nallowed=false\n")
-                        paste(800,300,"HTTP/1.1 200 OK\r\nX-Test: two\r\n\r\nallowed=true\n")
-                        click(185,101);time.sleep(.3);shot("glow-compare-diff.png")
-                        click(180,300);hotkey("a");hotkey("c")
-                        baseline=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "allowed=false" in baseline and "allowed=true" not in baseline,baseline
-                        click(800,300);hotkey("a");hotkey("c")
-                        candidate=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "allowed=true" in candidate,candidate
-                        # The Replay edit/send loop remains functional after command consolidation.
-                        hotkey("2");paste(300,134,f"http://{origin}")
-                        paste(180,300,f"GET /compressed.js HTTP/1.1\r\nHost: {origin}\r\n\r\n")
-                        hotkey("Return");wait_path("/compressed.js");time.sleep(.5)
-                        click(800,400);hotkey("a");hotkey("c")
-                        response=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "decoded JavaScript" in response and "Content-Encoding: gzip" in response,response
-                        shot("glow-replay-sent.png")
-                        paste(180,300,f"GET /glow-replay HTTP/1.1\r\nHost: {origin}\r\n\r\n")
-                        time.sleep(.5);hotkey("z");hotkey("Return");wait_path("/compressed.js")
-                        click(180,300);hotkey("y");hotkey("Return");wait_path("/glow-replay")
-                        # Variables remain directly usable in an actual Replay request.
-                        hotkey("comma");click(70,206);click(225,196)
-                        paste(250,196,"route");paste(570,196,"/glow-replay");shot("glow-variables-filled.png")
-                        hotkey("2");paste(180,300,f"GET {{{{route}}}} HTTP/1.1\r\nHost: {origin}\r\n\r\n")
-                        hotkey("Return");wait_path("/glow-replay")
-                        # Numeric payload generation and attributed durable results.
-                        hotkey("3");paste(300,104,f"http://{origin}")
-                        click(180,170);click(180,225)
-                        paste(120,203,"0000");paste(300,203,"0002")
-                        paste(180,420,f"GET /number/{{{{payload}}}} HTTP/1.1\r\nHost: {origin}\r\n\r\n")
-                        shot("glow-intruder-ready.png");click(860,104)
-                        for value in ("0000","0001","0002"):wait_path(f"/number/{value}")
-                        time.sleep(.5);shot("glow-intruder-results.png")
-                        # Select by payload cell, inspect its exact capture, then transfer it.
-                        click(200,764);time.sleep(.7);shot("followup-intruder-inspection.png")
-                        click(180,400);hotkey("a");hotkey("c")
-                        inspected=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "GET /number/0001 HTTP/1.1" in inspected,inspected
-                        click(800,400);hotkey("a");hotkey("c")
-                        inspected_response=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "/number/0001" in inspected_response,inspected_response
-                        click(180,400,3);click(220,420);time.sleep(.4)
-                        hotkey("Return");wait_path("/number/0001")
-                        # Inspecting a result must never overwrite the Intruder attack template.
-                        hotkey("3");click(70,103)
-                        click(180,420);hotkey("a");hotkey("c")
-                        template=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "{{payload}}" in template,template
-                        # Both directions are available from the editors themselves.
-                        click(180,420,3);click(220,440);time.sleep(.3)
-                        click(180,300);hotkey("a");hotkey("c")
-                        replay_template=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert replay_template==template,(template,replay_template)
-                        click(180,300,3);click(220,352);time.sleep(.3)
-                        click(180,420);hotkey("a");hotkey("c")
-                        returned=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert returned==template,(template,returned)
-                        # Per-pane wrapping must change only layout; the global default is saved.
-                        hotkey("2");click(45,104)
-                        paste(180,300,f"GET {{{{route}}}} HTTP/1.1\r\nHost: {origin}\r\nX-Wrap: {'abc' * 300}\r\n\r\n")
-                        hotkey("a");hotkey("c")
-                        before_wrap=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        click(75,203);shot("followup-replay-wrapped.png")
-                        click(180,300);hotkey("a");hotkey("c")
-                        after_wrap=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert after_wrap==before_wrap,(before_wrap,after_wrap)
-                        hotkey("comma");click(70,531);click(365,178);shot("followup-settings-wrap.png")
-                        # History's MIME search must show saved captures and transfer their executed request.
-                        hotkey("1");paste(180,101,"javascript");time.sleep(.8);shot("glow-history-mime.png")
-                        click(180,177);hotkey("r");time.sleep(.6);shot("glow-history-to-replay.png")
-                        click(180,300);hotkey("a");hotkey("c")
-                        transferred=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
-                        assert "GET /compressed.js HTTP/1.1" in transferred,transferred
-                        # Show a real refusal in the resizable Logs drawer.
-                        with socket.socket() as refused:
-                            refused.bind(("127.0.0.1",0))
-                            conn=http.client.HTTPConnection("127.0.0.1",int(port),timeout=5)
-                            endpoint=f"127.0.0.1:{refused.getsockname()[1]}"
-                            conn.request("GET",f"http://{endpoint}/refused",headers={"Host":endpoint,"Connection":"close"})
-                            conn.getresponse().read();conn.close()
-                        time.sleep(.5)
-                        height=int(subprocess.check_output(["identify","-format","%h",str(destination/"ui-capture.png")]))
-                        click(30,height-14);shot("glow-logs.png");click(30,height-14)
-                        # Inspect every task at the minimum supported window size.
-                        lib.XResizeWindow.argtypes=[c.c_void_p,c.c_ulong,c.c_uint,c.c_uint]
-                        lib.XResizeWindow(display,window,940,700);lib.XFlush(display);time.sleep(.4)
-                        for shortcut,name in [("1","history"),("2","replay"),("3","intruder"),("4","intercept"),("5","coder"),("6","compare"),("comma","settings")]:
-                            hotkey(shortcut);shot(f"glow-compact-{name}.png")
-                        print("PASS: selection to Coder, Compare, Replay Undo/Redo, variables, per-payload inspection, editor transfers, wrapping, MIME search and compact layouts")
-
+                        # Current task tabs: layout inspection and actual local CTF workflows.
+                        for shortcut,name in [("1","history"),("2","replay"),("3","intruder"),("4","intercept"),("5","coder"),("6","compare"),("7","attack"),("comma","settings")]:
+                            hotkey(shortcut);shot(f"glow-{name}.png")
+                        if args.layout_only:
+                            for y,name in [(174,"scope"),(206,"variables"),(238,"project"),(302,"execution"),(335,"interception"),(400,"network"),(432,"browser"),(465,"certificates"),(531,"display"),(563,"shortcuts")]:
+                                click(70,y);shot(f"glow-settings-{name}.png")
+                        else:
+                            # Selection using Shift+arrows must survive a secondary click.
+                            hotkey("2")
+                            paste(400,300,"GET /SGVsbG8= HTTP/1.1\r\n\r\n")
+                            hotkey("Home")
+                            for _ in range(5):key("Right",1);key("Right",0)
+                            key("Shift_L",1)
+                            for _ in range(8):key("Right",1);key("Right",0)
+                            key("Shift_L",0);lib.XFlush(display);time.sleep(.2)
+                            click(410,235,3);shot("glow-selection-menu.png")
+                            click(510,367);time.sleep(.3);shot("glow-coder-selected.png")
+                            click(180,300);hotkey("a");hotkey("c")
+                            selected=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert selected=="SGVsbG8=",selected
+                            click(160,134);time.sleep(.2)
+                            click(800,300);hotkey("a");hotkey("c")
+                            decoded=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert decoded=="Hello",decoded
+                            shot("glow-coder-decoded.png")
+                            # Mouse drag selection uses the same exact transfer path.
+                            click(180,300);hotkey("a");paste_selection("prefix SGVsbG8= suffix")
+                            xtst.XTestFakeMotionEvent(display,-1,root_x.value+79,root_y.value+220,0)
+                            xtst.XTestFakeButtonEvent(display,1,1,0);lib.XFlush(display);time.sleep(.1)
+                            for x in range(87,144,8):
+                                xtst.XTestFakeMotionEvent(display,-1,root_x.value+x,root_y.value+220,0);lib.XFlush(display);time.sleep(.06)
+                            xtst.XTestFakeButtonEvent(display,1,0,0);lib.XFlush(display);time.sleep(.2)
+                            click(110,224,3);shot("glow-mouse-selection.png");click(180,244)
+                            click(180,300);hotkey("a");hotkey("c")
+                            dragged=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert dragged=="SGVsbG8=",dragged
+                            # Compare two real message bodies in the paired highlighted view.
+                            hotkey("6")
+                            paste(180,300,"HTTP/1.1 200 OK\r\nX-Test: one\r\n\r\nallowed=false\n")
+                            paste(800,300,"HTTP/1.1 200 OK\r\nX-Test: two\r\n\r\nallowed=true\n")
+                            click(185,101);time.sleep(.3);shot("glow-compare-diff.png")
+                            click(180,300);hotkey("a");hotkey("c")
+                            baseline=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert "allowed=false" in baseline and "allowed=true" not in baseline,baseline
+                            click(800,300);hotkey("a");hotkey("c")
+                            candidate=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert "allowed=true" in candidate,candidate
+                            # The Replay edit/send loop remains functional after command consolidation.
+                            hotkey("2");paste(500,134,f"http://{origin}")
+                            paste(400,300,f"GET /compressed.js HTTP/1.1\r\nHost: {origin}\r\n\r\n")
+                            hotkey("Return");wait_path("/compressed.js");time.sleep(.5)
+                            click(800,400);hotkey("a");hotkey("c")
+                            response=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert "decoded JavaScript" in response and "Content-Encoding: gzip" in response,response
+                            shot("glow-replay-sent.png")
+                            paste(400,300,f"GET /glow-replay HTTP/1.1\r\nHost: {origin}\r\n\r\n")
+                            time.sleep(.5);hotkey("z");hotkey("Return");wait_path("/compressed.js")
+                            click(400,300);hotkey("y");hotkey("Return");wait_path("/glow-replay")
+                            # Variables remain directly usable in an actual Replay request.
+                            hotkey("comma");click(70,206);click(225,196)
+                            paste(250,196,"route");paste(570,196,"/glow-replay");shot("glow-variables-filled.png")
+                            hotkey("2");paste(400,300,f"GET {{{{route}}}} HTTP/1.1\r\nHost: {origin}\r\n\r\n")
+                            hotkey("Return");wait_path("/glow-replay")
+                            # Numeric payload generation and attributed durable results.
+                            hotkey("3");paste(300,104,f"http://{origin}")
+                            click(180,170);click(180,225)
+                            paste(120,203,"0000");paste(300,203,"0002")
+                            paste(180,420,f"GET /number/{{{{payload}}}} HTTP/1.1\r\nHost: {origin}\r\n\r\n")
+                            shot("glow-intruder-ready.png");click(860,104)
+                            for value in ("0000","0001","0002"):wait_path(f"/number/{value}")
+                            time.sleep(.5);shot("glow-intruder-results.png")
+                            # Select by payload cell, inspect its exact capture, then transfer it.
+                            click(200,764);time.sleep(.7);shot("followup-intruder-inspection.png")
+                            click(180,400);hotkey("a");hotkey("c")
+                            inspected=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert "GET /number/0001 HTTP/1.1" in inspected,inspected
+                            click(800,400);hotkey("a");hotkey("c")
+                            inspected_response=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert "/number/0001" in inspected_response,inspected_response
+                            click(180,400,3);click(220,420);time.sleep(.4)
+                            hotkey("Return");wait_path("/number/0001")
+                            # Inspecting a result must never overwrite the Intruder attack template.
+                            hotkey("3");click(70,103)
+                            click(180,420);hotkey("a");hotkey("c")
+                            template=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert "{{payload}}" in template,template
+                            # Both directions are available from the editors themselves.
+                            click(180,420,3);click(220,440);time.sleep(.3)
+                            click(400,300);hotkey("a");hotkey("c")
+                            replay_template=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert replay_template==template,(template,replay_template)
+                            click(400,300,3);click(450,352);time.sleep(.3)
+                            click(180,420);hotkey("a");hotkey("c")
+                            returned=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert returned==template,(template,returned)
+                            # Per-pane wrapping must change only layout; the global default is saved.
+                            hotkey("2");click(75,222)
+                            paste(400,300,f"GET {{{{route}}}} HTTP/1.1\r\nHost: {origin}\r\nX-Wrap: {'abc' * 300}\r\n\r\n")
+                            hotkey("a");hotkey("c")
+                            before_wrap=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            click(282,203);shot("followup-replay-wrapped.png")
+                            click(400,300);hotkey("a");hotkey("c")
+                            after_wrap=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert after_wrap==before_wrap,(before_wrap,after_wrap)
+                            hotkey("comma");click(70,531);click(365,178);shot("followup-settings-wrap.png")
+                            # History's MIME search must show saved captures and transfer their executed request.
+                            hotkey("1");paste(180,101,"javascript");time.sleep(.8);shot("glow-history-mime.png")
+                            click(180,177);hotkey("r");time.sleep(.6);shot("glow-history-to-replay.png")
+                            click(400,300);hotkey("a");hotkey("c")
+                            transferred=subprocess.check_output(["xclip","-display",display_name,"-selection","clipboard","-o"],timeout=5).decode()
+                            assert "GET /compressed.js HTTP/1.1" in transferred,transferred
+                            # Show a real refusal in the resizable Logs drawer.
+                            with socket.socket() as refused:
+                                refused.bind(("127.0.0.1",0))
+                                conn=http.client.HTTPConnection("127.0.0.1",int(port),timeout=5)
+                                endpoint=f"127.0.0.1:{refused.getsockname()[1]}"
+                                conn.request("GET",f"http://{endpoint}/refused",headers={"Host":endpoint,"Connection":"close"})
+                                conn.getresponse().read();conn.close()
+                            time.sleep(.5)
+                            height=int(subprocess.check_output(["identify","-format","%h",str(destination/"ui-capture.png")]))
+                            click(30,height-14);shot("glow-logs.png");click(30,height-14)
+                            # Inspect every task at the minimum supported window size.
+                            lib.XResizeWindow.argtypes=[c.c_void_p,c.c_ulong,c.c_uint,c.c_uint]
+                            lib.XResizeWindow(display,window,940,700);lib.XFlush(display);time.sleep(.4)
+                            for shortcut,name in [("1","history"),("2","replay"),("3","intruder"),("4","intercept"),("5","coder"),("6","compare"),("7","attack"),("comma","settings")]:
+                                hotkey(shortcut);shot(f"glow-compact-{name}.png")
+                            print("PASS: selection to Coder, Compare, Replay Undo/Redo, variables, per-payload inspection, editor transfers, wrapping, MIME search and compact layouts")
                 event = XEvent()
                 event.message.type = 33  # ClientMessage
                 event.message.window = window
@@ -346,7 +363,10 @@ def main():
                 lib.XSendEvent(display, window, 0, 0, c.byref(event))
                 lib.XFlush(display)
                 assert app.wait(timeout=5) == 0, "UI failed graceful shutdown"
-                if not args.capture_only and not args.layout_only:
+                if args.attack_only:
+                    from attack_smoke import verify
+                    verify(project_path,jwt_only=args.jwt_only)
+                if not args.capture_only and not args.layout_only and not args.attack_only:
                     with sqlite3.connect(project_path/"project.sqlite") as database:
                         state=json.loads(database.execute("SELECT json FROM state WHERE id=1").fetchone()[0])
                         assert state["settings"]["wrap_lines"] is True,state["settings"]
@@ -382,7 +402,7 @@ def main():
                         if "READY " in log.read():break
                         time.sleep(.1)
                     else:raise RuntimeError("saved project failed to reopen")
-                    hotkey("2");shot("glow-recovered-replay.png")
+                    hotkey("2");click(75,222);shot("glow-recovered-replay.png")
                     hotkey("Return");wait_path("/glow-replay")
                     event.message.window=window;lib.XSendEvent(display,window,0,0,c.byref(event));lib.XFlush(display)
                     assert app.wait(timeout=5)==0

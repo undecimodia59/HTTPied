@@ -855,6 +855,15 @@ async fn http_exchange(
         })?
         .map_err(|error| phase_error("HTTP request write", p.authority.as_str(), error))?;
     tracing::debug!(authority=%p.authority,"upstream HTTP request sent; awaiting response");
+    receive_exchange(p, upstream, cfg, sink, started).await
+}
+async fn receive_exchange(
+    p: Prepared,
+    upstream: &mut dyn crate::Transport,
+    cfg: &Config,
+    sink: Option<&mut dyn crate::Transport>,
+    started: &mut bool,
+) -> io::Result<WireExecution> {
     let response_offset_ms = p.started.elapsed().as_secs_f64() * 1000.0;
     let capture = timeout(
         cfg.total_timeout,
@@ -942,4 +951,77 @@ fn is_websocket(p: &Prepared) -> bool {
     p.parsed.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case(b"websocket")
     })
+}
+
+/// A prepared HTTP/1.1 request whose final byte has not been written yet.
+pub(crate) struct StagedRace {
+    prepared: Prepared,
+    transport: Box<dyn crate::Transport>,
+}
+pub(crate) async fn stage_race(bytes: Vec<u8>, cfg: &Config) -> io::Result<StagedRace> {
+    timeout(cfg.total_timeout, async {
+        let p = prepare(&mut std::io::Cursor::new(bytes), cfg).await?;
+        if p.tunnel {
+            return Err(invalid("Race requests cannot use CONNECT"));
+        }
+        let tcp = connect(&p, cfg).await?;
+        let mut transport: Box<dyn crate::Transport> = if p.parsed.target.starts_with("https:") {
+            #[cfg(feature = "tls-spike")]
+            {
+                let host = p.authority.host().trim_matches(['[', ']']);
+                Box::new(if let Some(ca) = &cfg.ca {
+                    ca.connect(host, tcp, cfg.connect_timeout).await?
+                } else {
+                    crate::authority::Authority::connect_public(host, tcp, cfg.connect_timeout)
+                        .await?
+                })
+            }
+            #[cfg(not(feature = "tls-spike"))]
+            {
+                return Err(invalid("HTTPS requires TLS support"));
+            }
+        } else {
+            Box::new(tcp)
+        };
+        let prefix = p
+            .outgoing
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| invalid("Empty race request"))?;
+        timeout(cfg.idle_timeout, async {
+            transport.write_all(&p.outgoing[..prefix]).await?;
+            transport.flush().await
+        })
+        .await??;
+        Ok(StagedRace {
+            prepared: p,
+            transport,
+        })
+    })
+    .await?
+}
+impl StagedRace {
+    pub(crate) async fn release(
+        mut self,
+        cfg: Config,
+        origin: std::time::Instant,
+    ) -> io::Result<(WireExecution, u64)> {
+        timeout(cfg.total_timeout, async {
+            let offset = origin.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.transport
+                .write_all(&self.prepared.outgoing[self.prepared.outgoing.len() - 1..])
+                .await?;
+            self.transport.flush().await?;
+            let execution = receive_exchange(
+                self.prepared,
+                self.transport.as_mut(),
+                &cfg,
+                None,
+                &mut false,
+            )
+            .await?;
+            Ok((execution, offset))
+        })
+        .await?
+    }
 }

@@ -395,6 +395,7 @@ pub struct ProjectState {
     pub replays: Vec<SavedRequest>,
     pub replay_groups: Vec<String>,
     pub selected_replay: usize,
+    pub attack_workspace: crate::campaign::Workspace,
     pub columns: Vec<String>,
     pub column_widths: BTreeMap<String, f32>,
     pub rules: Vec<RewriteRule>,
@@ -419,6 +420,8 @@ impl ProjectState {
     }
     pub fn validate(&self) -> Result<(), String> {
         self.settings.validate()?;
+        // An empty Attack workspace is valid before a request has been sent to it.
+        self.attack_workspace.validate_storage()?;
         if self.column_widths.len() > 32
             || self
                 .column_widths
@@ -487,6 +490,7 @@ impl Default for ProjectState {
             replays: vec![],
             replay_groups: vec![],
             selected_replay: 0,
+            attack_workspace: Default::default(),
             columns: [
                 "#", "Method", "Status", "Protocol", "Host", "Endpoint", "Duration", "Size",
             ]

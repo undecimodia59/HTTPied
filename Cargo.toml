@@ -34,6 +34,9 @@ encoding_rs = "0.8"
 fs2 = "0.4"
 quick-xml = { version = "0.38", features = ["escape-html"] }
 sha2 = "0.10"
+hmac = "0.12.1"
+cookie_store = { version = "0.22.1", default-features = false }
+regex = "1.12"
 
 time = { version = "0.3", optional = true }
 tokio-rustls = { version = "0.26.6", optional = true, default-features = false, features = ["ring", "tls12"] }

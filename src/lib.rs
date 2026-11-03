@@ -49,3 +49,6 @@ pub mod trust;
 pub mod diagnostics;
 
 pub mod coder;
+
+pub mod campaign;
+pub mod jwt;

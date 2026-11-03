@@ -195,6 +195,10 @@ impl Spike {
                     transfer = Some(Tab::Intruder);
                     ui.close();
                 }
+                if ui.button("Send to Attack").clicked() {
+                    transfer = Some(Tab::Attack);
+                    ui.close();
+                }
                 if ui.button("Copy URL").clicked() {
                     ui.ctx().copy_text(url.clone());
                     ui.close();

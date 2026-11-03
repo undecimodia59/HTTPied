@@ -38,6 +38,22 @@ fn private_export(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 }
 pub enum Command {
     Shutdown,
+    CampaignSave(crate::campaign::SavedRun),
+    CampaignFinish {
+        id: u64,
+        status: String,
+    },
+    CampaignRecord(crate::campaign::Record),
+    CampaignList,
+    CampaignCompare {
+        id: u64,
+        baseline: usize,
+        variant: usize,
+    },
+    CampaignLoad {
+        id: u64,
+        offset: usize,
+    },
     WriteLogs(Vec<crate::activity::Record>),
     ClearLogs,
     InstallTrust {
@@ -89,6 +105,17 @@ pub enum Command {
     },
 }
 pub enum Reply {
+    CampaignComparison {
+        original: Box<Event>,
+        modified: Box<Event>,
+    },
+    CampaignList(Vec<crate::campaign::RunSummary>),
+    CampaignLoad {
+        run: Box<crate::campaign::SavedRun>,
+        rows: Vec<crate::campaign::Record>,
+        total: u64,
+        offset: usize,
+    },
     LogWrite(Result<(), String>),
     Trust(Result<crate::trust::Status, String>),
     Opened {
@@ -352,6 +379,8 @@ impl Project {
             state.validate()?;
             state
         };
+        db.execute_batch("CREATE TABLE IF NOT EXISTS campaign_runs(id INTEGER PRIMARY KEY,json TEXT NOT NULL); CREATE TABLE IF NOT EXISTS campaign_results(run_id INTEGER,idx INTEGER,json TEXT NOT NULL,PRIMARY KEY(run_id,idx));").map_err(|e|e.to_string())?;
+        let campaign_used: u64 = db.query_row("SELECT (SELECT COALESCE(SUM(length(CAST(json AS BLOB))),0) FROM campaign_runs)+(SELECT COALESCE(SUM(length(CAST(json AS BLOB))),0) FROM campaign_results)", [], |r|r.get(0)).map_err(|e|e.to_string())?;
         let capture_used:u64=db.query_row("SELECT COALESCE(SUM(length(request)+length(outgoing)+length(response)+length(response_sent)+length(meta)),0) FROM captures",[],|r|r.get(0)).map_err(|e|e.to_string())?;
         let result_used: u64 = db
             .query_row(
@@ -367,7 +396,7 @@ impl Project {
                 |r| r.get(0),
             )
             .map_err(|e| e.to_string())?;
-        let used = capture_used + result_used + log_used;
+        let used = capture_used + result_used + log_used + campaign_used;
         if create {
             let json = serde_json::to_string(&state).map_err(|e| e.to_string())?;
             db.execute("INSERT INTO state(id,json) VALUES(1,?1)", [json])
@@ -775,7 +804,7 @@ impl Project {
                 test_home.as_deref(),
             ))),
             Command::Purge => {
-                self.db().execute_batch("BEGIN IMMEDIATE; DELETE FROM captures; DELETE FROM results; COMMIT; PRAGMA wal_checkpoint(TRUNCATE); VACUUM;").map_err(|e|e.to_string())?;
+                self.db().execute_batch("BEGIN IMMEDIATE; DELETE FROM captures; DELETE FROM results; DELETE FROM campaign_results; DELETE FROM campaign_runs; COMMIT; PRAGMA wal_checkpoint(TRUNCATE); VACUUM;").map_err(|e|e.to_string())?;
                 let logs: u64 = self
                     .db()
                     .query_row(
@@ -918,6 +947,123 @@ impl Project {
                     rows,
                     total,
                     run_id,
+                })
+            }
+            Command::CampaignFinish { id, status } => {
+                let json: String = self
+                    .db()
+                    .query_row("SELECT json FROM campaign_runs WHERE id=?1", [id], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| e.to_string())?;
+                let mut run: crate::campaign::SavedRun =
+                    serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                run.status = status;
+                self.apply(Command::CampaignSave(run))
+            }
+            Command::CampaignSave(run) => {
+                run.workspace.validate()?;
+                let json = serde_json::to_string(&run).map_err(|e| e.to_string())?;
+                let previous: u64 = self.db().query_row("SELECT COALESCE((SELECT length(CAST(json AS BLOB)) FROM campaign_runs WHERE id=?1),0)", [run.id], |r|r.get(0)).map_err(|e|e.to_string())?;
+                let used = self.used.get().saturating_sub(previous) + json.len() as u64;
+                if used > self.state.settings.disk_quota_mib * 1024 * 1024 {
+                    return Err("Project disk quota reached; Attack plan was not saved".into());
+                }
+                self.db().execute("INSERT INTO campaign_runs VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET json=excluded.json",params![run.id,json]).map_err(|e|e.to_string())?;
+                self.used.set(used);
+                Ok(Reply::Saved)
+            }
+            Command::CampaignRecord(record) => {
+                let json = serde_json::to_string(&record).map_err(|e| e.to_string())?;
+                let previous: u64 = self.db().query_row("SELECT COALESCE((SELECT length(CAST(json AS BLOB)) FROM campaign_results WHERE run_id=?1 AND idx=?2),0)", params![record.run_id,record.index], |r|r.get(0)).map_err(|e|e.to_string())?;
+                let used = self.used.get().saturating_sub(previous) + json.len() as u64;
+                if used > self.state.settings.disk_quota_mib * 1024 * 1024 {
+                    return Err("Project disk quota reached; Attack result was not saved".into());
+                }
+                self.db().execute("INSERT INTO campaign_results VALUES(?1,?2,?3) ON CONFLICT(run_id,idx) DO UPDATE SET json=excluded.json",params![record.run_id,record.index,json]).map_err(|e|e.to_string())?;
+                self.used.set(used);
+                Ok(Reply::Saved)
+            }
+            Command::CampaignCompare {
+                id,
+                baseline,
+                variant,
+            } => {
+                let find = |index: usize| -> Result<u64, String> {
+                    let json: String = self
+                        .db()
+                        .query_row(
+                            "SELECT json FROM campaign_results WHERE run_id=?1 AND idx=?2",
+                            params![id, index],
+                            |row| row.get(0),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let record: crate::campaign::Record =
+                        serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                    record
+                        .capture_id
+                        .ok_or_else(|| "No response was captured for this attempt".into())
+                };
+                Ok(Reply::CampaignComparison {
+                    original: Box::new(self.detail(find(baseline)?)?),
+                    modified: Box::new(self.detail(find(variant)?)?),
+                })
+            }
+            Command::CampaignList => {
+                let mut stmt=self.db().prepare("SELECT id,json_extract(json,'$.name'),json_extract(json,'$.workspace.kind') FROM campaign_runs ORDER BY id DESC LIMIT 32").map_err(|e|e.to_string())?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, u64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                let mut runs = Vec::new();
+                for row in rows {
+                    let (id, name, kind) = row.map_err(|e| e.to_string())?;
+                    let kind = serde_json::from_value(serde_json::Value::String(kind))
+                        .map_err(|e| e.to_string())?;
+                    runs.push(crate::campaign::RunSummary { id, name, kind });
+                }
+                Ok(Reply::CampaignList(runs))
+            }
+            Command::CampaignLoad { id, offset } => {
+                let json: String = self
+                    .db()
+                    .query_row("SELECT json FROM campaign_runs WHERE id=?1", [id], |r| {
+                        r.get(0)
+                    })
+                    .map_err(|e| e.to_string())?;
+                if json.len() > 8 * 1024 * 1024 {
+                    return Err("Saved Attack plan exceeds the supported limit".into());
+                }
+                let run = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+                let total = self
+                    .db()
+                    .query_row(
+                        "SELECT count(*) FROM campaign_results WHERE run_id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                let mut statement=self.db().prepare("SELECT json FROM campaign_results WHERE run_id=?1 ORDER BY idx LIMIT 128 OFFSET ?2").map_err(|e|e.to_string())?;
+                let rows = statement
+                    .query_map(params![id, offset], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                let mut records = Vec::new();
+                for row in rows {
+                    records.push(
+                        serde_json::from_str(&row.map_err(|e| e.to_string())?)
+                            .map_err(|e| e.to_string())?,
+                    );
+                }
+                Ok(Reply::CampaignLoad {
+                    run: Box::new(run),
+                    rows: records,
+                    total,
+                    offset,
                 })
             }
             Command::Save(state) => {
@@ -1589,6 +1735,113 @@ mod tests {
         assert_eq!(rows[0].capture_id, Some(132));
         project.apply(Command::Purge).unwrap();
         assert_eq!(project.total().unwrap(), 0);
+    }
+    #[test]
+    fn large_replay_groups_and_attack_evidence_survive_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "httpied-attack-storage-{}-{}",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut project =
+            Project::open(path.clone(), true, false, "Attack persistence".into()).unwrap();
+        project.state.replay_groups = vec!["CTF lab".into()];
+        project.state.replays = (0..33)
+            .map(|index| crate::state::SavedRequest {
+                name: format!("Request {index}"),
+                group: "CTF lab".into(),
+                destination: "http://local".into(),
+                timeout_secs: 0,
+                request: format!(
+                    "POST / HTTP/1.1\r\nHost: local\r\n\r\n{}",
+                    "a".repeat(128000)
+                ),
+            })
+            .collect();
+        project.state.selected_replay = 32;
+        assert!(serde_json::to_string(&project.state).unwrap().len() > 4 * 1024 * 1024);
+        project.state.validate().unwrap();
+        project.save().unwrap();
+        let workspace = crate::campaign::Workspace {
+            steps: vec![crate::campaign::Step {
+                destination: "http://local".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        project
+            .apply(Command::CampaignSave(crate::campaign::SavedRun {
+                id: 99,
+                name: "Fixture race".into(),
+                workspace,
+                variables: vec![],
+                status: "Running".into(),
+            }))
+            .unwrap();
+        for (index, body) in ["original", "modified"].into_iter().enumerate() {
+            let Event::Exchange(mut execution) = fixture() else {
+                panic!()
+            };
+            execution.response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes();
+            execution.response_status = 200;
+            execution.response_total_bytes = execution.response.len() as u64;
+            project
+                .store(700 + index as u64, &Event::Exchange(execution))
+                .unwrap();
+            project
+                .apply(Command::CampaignRecord(crate::campaign::Record {
+                    run_id: 99,
+                    index,
+                    capture_id: Some(700 + index as u64),
+                    baseline: if index == 1 { Some(0) } else { None },
+                    ..Default::default()
+                }))
+                .unwrap();
+        }
+        project
+            .apply(Command::CampaignFinish {
+                id: 99,
+                status: "Cancelled by operator".into(),
+            })
+            .unwrap();
+        drop(project);
+        let mut reopened = Project::open(path.clone(), false, false, String::new()).unwrap();
+        assert_eq!(reopened.state.replays.len(), 33);
+        assert_eq!(reopened.state.selected_replay, 32);
+        assert_eq!(reopened.state.replay_groups, vec!["CTF lab"]);
+        let Reply::CampaignLoad {
+            run, rows, total, ..
+        } = reopened
+            .apply(Command::CampaignLoad { id: 99, offset: 0 })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(run.status, "Cancelled by operator");
+        assert_eq!(total, 2);
+        assert_eq!(rows[1].capture_id, Some(701));
+        let Reply::CampaignComparison { original, modified } = reopened
+            .apply(Command::CampaignCompare {
+                id: 99,
+                baseline: 0,
+                variant: 1,
+            })
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(matches!(*original,Event::Exchange(e) if e.response.ends_with(b"original")));
+        assert!(matches!(*modified,Event::Exchange(e) if e.response.ends_with(b"modified")));
+        reopened.apply(Command::Purge).unwrap();
+        assert!(
+            matches!(reopened.apply(Command::CampaignList).unwrap(),Reply::CampaignList(runs) if runs.is_empty())
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn project_state_survives_reopen_and_temp_is_removed() {

@@ -36,15 +36,60 @@ impl Workflow {
             self.new_group.clear();
         }
     }
+    fn choose_replay(
+        &mut self,
+        index: usize,
+        modifiers: egui::Modifiers,
+        visible: &[(usize, u64)],
+    ) {
+        if modifiers.shift {
+            let from = self.selected_replay.min(index);
+            let to = self.selected_replay.max(index);
+            for &(position, id) in visible {
+                if (from..=to).contains(&position) {
+                    self.replay_selection.insert(id);
+                }
+            }
+        } else if modifiers.ctrl {
+            if self.replay_selection.is_empty() {
+                self.replay_selection
+                    .insert(self.replays[self.selected_replay].editor_id);
+            }
+            let id = self.replays[index].editor_id;
+            if !self.replay_selection.remove(&id) {
+                self.replay_selection.insert(id);
+            }
+        } else {
+            self.replay_selection.clear();
+        }
+        self.selected_replay = index;
+    }
+    fn adjacent_replay(&self, direction: isize) -> Option<usize> {
+        let group = &self.replays[self.selected_replay].group;
+        let members = self
+            .replays
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| &tool.group == group)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let current = members
+            .iter()
+            .position(|index| *index == self.selected_replay)?;
+        let next = current.checked_add_signed(direction)?;
+        members.get(next).copied()
+    }
     pub(super) fn replay_sessions(&mut self, ui: &mut egui::Ui) {
         let groups = self.groups();
-        let active = self.active.is_some();
+        let active = self.active.is_some() || self.external_active;
         egui::Panel::left("replay-collections")
             .resizable(true)
             .default_size(205.0)
             .size_range(160.0..=340.0)
             .show(ui, |ui| {
-                if active { ui.disable(); }
+                if active {
+                    ui.disable();
+                }
                 ui.strong("Replay requests");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.replay_search)
@@ -115,6 +160,10 @@ impl Workflow {
                                     .id_salt(("replay-group", &group))
                                     .default_open(true)
                                     .show(ui, |ui| {
+                                        let visible = members
+                                            .iter()
+                                            .map(|(index, id, _, _)| (*index, *id))
+                                            .collect::<Vec<_>>();
                                         for (index, id, name, changed) in members {
                                             let title = format!(
                                                 "{}{}",
@@ -125,8 +174,11 @@ impl Workflow {
                                                 },
                                                 if changed { " •" } else { "" }
                                             );
-                                            let selected = index == self.selected_replay
-                                                || self.replay_selection.contains(&id);
+                                            let selected = if self.replay_selection.is_empty() {
+                                                index == self.selected_replay
+                                            } else {
+                                                self.replay_selection.contains(&id)
+                                            };
                                             let response = ui.add(
                                                 egui::Button::new(title)
                                                     .selected(selected)
@@ -135,25 +187,12 @@ impl Workflow {
                                             response.dnd_set_drag_payload(id);
                                             if response.clicked() {
                                                 let modifiers = ui.input(|input| input.modifiers);
-                                                if modifiers.shift {
-                                                    let from = self.selected_replay.min(index);
-                                                    let to = self.selected_replay.max(index);
-                                                    for tool in &self.replays[from..=to] {
-                                                        self.replay_selection
-                                                            .insert(tool.editor_id);
-                                                    }
-                                                } else if modifiers.ctrl {
-                                                    if !self.replay_selection.remove(&id) {
-                                                        self.replay_selection.insert(id);
-                                                    }
-                                                } else {
-                                                    self.replay_selection.clear();
-                                                }
-                                                self.selected_replay = index;
+                                                self.choose_replay(index, modifiers, &visible);
                                             }
                                             response.context_menu(|ui| {
                                                 if ui.button("Select request").clicked() {
                                                     self.selected_replay = index;
+                                                    self.replay_selection.clear();
                                                     ui.close();
                                                 }
                                                 ui.menu_button("Move to group", |ui| {
@@ -198,6 +237,20 @@ impl Workflow {
                                         }
                                     });
                                     ui.ctx().data_mut(|data| data.insert_temp(rename_key, name));
+                                    if ui.button("Send group to Attack").clicked() {
+                                        let requests = self
+                                            .saved_requests()
+                                            .into_iter()
+                                            .filter(|request| request.group == group)
+                                            .collect::<Vec<_>>();
+                                        ui.ctx().data_mut(|data| {
+                                            data.insert_temp(
+                                                egui::Id::new("attack-group-transfer"),
+                                                requests,
+                                            )
+                                        });
+                                        ui.close();
+                                    }
                                     if ui.button("Remove group; keep requests").clicked() {
                                         removed = Some(group.clone());
                                         ui.close();
@@ -238,89 +291,106 @@ impl Workflow {
                 }
             });
         ui.scope(|ui| {
-            if active { ui.disable(); }
-            ui.horizontal_wrapped(|ui| {
-            ui.strong(&self.replays[self.selected_replay].name);
-            if ui
-                .add_enabled(
-                    self.replays.len() < crate::state::MAX_REPLAYS,
-                    egui::Button::new("+ New"),
-                )
-                .clicked()
-            {
-                let mut tool = Tool::new();
-                tool.group = self.replays[self.selected_replay].group.clone();
-                self.replays.push(tool);
-                self.selected_replay = self.replays.len() - 1;
-                self.replay_selection.clear();
+            if active {
+                ui.disable();
             }
-            ui.menu_button("Session", |ui| {
-                ui.label("Name");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.replays[self.selected_replay].name)
-                        .char_limit(64)
-                        .desired_width(180.0),
-                );
-                ui.menu_button("Move selection to group", |ui| {
-                    for group in std::iter::once(String::new()).chain(groups.iter().cloned()) {
-                        if ui
-                            .button(if group.is_empty() {
-                                "Ungrouped"
-                            } else {
-                                &group
-                            })
-                            .clicked()
-                        {
-                            self.move_selection(&group);
-                            ui.close();
-                        }
-                    }
-                });
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&self.replays[self.selected_replay].name);
                 if ui
                     .add_enabled(
                         self.replays.len() < crate::state::MAX_REPLAYS,
-                        egui::Button::new("Duplicate request"),
+                        egui::Button::new("+ New"),
                     )
                     .clicked()
                 {
-                    let current = &self.replays[self.selected_replay];
-                    let mut copy = Tool::new();
-                    copy.destination = current.destination.clone();
-                    copy.request = current.request.clone();
-                    copy.name = format!("{} copy", current.name);
-                    copy.group = current.group.clone();
-                    copy.timeout_secs = current.timeout_secs;
-                    self.replays.push(copy);
+                    let mut tool = Tool::new();
+                    tool.group = self.replays[self.selected_replay].group.clone();
+                    self.replays.push(tool);
                     self.selected_replay = self.replays.len() - 1;
-                    ui.close();
+                    self.replay_selection.clear();
                 }
-                for (label, direction) in [("Move up", -1), ("Move down", 1)] {
-                    let next = self.selected_replay.saturating_add_signed(direction);
+                if ui.button("Send selection to Attack").clicked() {
+                    let selected = self.replays[self.selected_replay].editor_id;
+                    let requests = self
+                        .replays
+                        .iter()
+                        .zip(self.saved_requests())
+                        .filter(|(tool, _)| {
+                            self.replay_selection.contains(&tool.editor_id)
+                                || (self.replay_selection.is_empty() && tool.editor_id == selected)
+                        })
+                        .map(|(_, saved)| saved)
+                        .collect::<Vec<_>>();
+                    ui.ctx().data_mut(|data| {
+                        data.insert_temp(egui::Id::new("attack-group-transfer"), requests)
+                    });
+                }
+                ui.menu_button("Session", |ui| {
+                    ui.label("Name");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.replays[self.selected_replay].name)
+                            .char_limit(64)
+                            .desired_width(180.0),
+                    );
+                    ui.menu_button("Move selection to group", |ui| {
+                        for group in std::iter::once(String::new()).chain(groups.iter().cloned()) {
+                            if ui
+                                .button(if group.is_empty() {
+                                    "Ungrouped"
+                                } else {
+                                    &group
+                                })
+                                .clicked()
+                            {
+                                self.move_selection(&group);
+                                ui.close();
+                            }
+                        }
+                    });
                     if ui
                         .add_enabled(
-                            next != self.selected_replay && next < self.replays.len(),
-                            egui::Button::new(label),
+                            self.replays.len() < crate::state::MAX_REPLAYS,
+                            egui::Button::new("Duplicate request"),
                         )
                         .clicked()
                     {
-                        self.replays.swap(self.selected_replay, next);
-                        self.selected_replay = next;
+                        let current = &self.replays[self.selected_replay];
+                        let mut copy = Tool::new();
+                        copy.destination = current.destination.clone();
+                        copy.request = current.request.clone();
+                        copy.name = format!("{} copy", current.name);
+                        copy.group = current.group.clone();
+                        copy.timeout_secs = current.timeout_secs;
+                        self.replays.push(copy);
+                        self.selected_replay = self.replays.len() - 1;
+                        self.replay_selection.clear();
                         ui.close();
                     }
-                }
-                if ui
-                    .add_enabled(self.replays.len() > 1, egui::Button::new("Close request"))
-                    .clicked()
-                {
-                    let id = self.replays[self.selected_replay].editor_id;
-                    syntax::forget_editor(ui.ctx(), egui::Id::new(("request", id)));
-                    syntax::forget_editor(ui.ctx(), egui::Id::new(("response", id)));
-                    self.replay_selection.remove(&id);
-                    self.replays.remove(self.selected_replay);
-                    self.selected_replay = self.selected_replay.min(self.replays.len() - 1);
-                    ui.close();
-                }
-            });
+                    for (label, direction) in [("Move up", -1), ("Move down", 1)] {
+                        let next = self.adjacent_replay(direction);
+                        if ui
+                            .add_enabled(next.is_some(), egui::Button::new(label))
+                            .clicked()
+                        {
+                            let next = next.unwrap();
+                            self.replays.swap(self.selected_replay, next);
+                            self.selected_replay = next;
+                            ui.close();
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.replays.len() > 1, egui::Button::new("Close request"))
+                        .clicked()
+                    {
+                        let id = self.replays[self.selected_replay].editor_id;
+                        syntax::forget_editor(ui.ctx(), egui::Id::new(("request", id)));
+                        syntax::forget_editor(ui.ctx(), egui::Id::new(("response", id)));
+                        self.replay_selection.remove(&id);
+                        self.replays.remove(self.selected_replay);
+                        self.selected_replay = self.selected_replay.min(self.replays.len() - 1);
+                        ui.close();
+                    }
+                });
             });
         });
     }
@@ -329,6 +399,34 @@ impl Workflow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn additive_selection_keeps_the_anchor_and_shift_skips_hidden_requests() {
+        let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());
+        workflow.replays.extend([Tool::new(), Tool::new()]);
+        let first = workflow.replays[0].editor_id;
+        let second = workflow.replays[1].editor_id;
+        let third = workflow.replays[2].editor_id;
+        workflow.choose_replay(
+            1,
+            egui::Modifiers::CTRL,
+            &[(0, first), (1, second), (2, third)],
+        );
+        assert_eq!(
+            workflow.replay_selection,
+            std::collections::BTreeSet::from([first, second])
+        );
+        workflow.replay_selection.clear();
+        workflow.selected_replay = 0;
+        workflow.choose_replay(2, egui::Modifiers::SHIFT, &[(0, first), (2, third)]);
+        assert_eq!(
+            workflow.replay_selection,
+            std::collections::BTreeSet::from([first, third])
+        );
+        workflow.replays[1].group = "Other".into();
+        workflow.replays[0].group = "Lab".into();
+        workflow.replays[2].group = "Lab".into();
+        assert_eq!(workflow.adjacent_replay(-1), Some(0));
+    }
     #[test]
     fn groups_and_selected_request_survive_reopen_without_losing_drafts() {
         let mut workflow = Workflow::offline("127.0.0.1:8080".parse().unwrap());

@@ -395,6 +395,12 @@ fn selection_menu(
                     ui.close();
                 }
             }
+            if ui.button("Send request to Attack").clicked() {
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(egui::Id::new("attack-request-transfer"), source)
+                });
+                ui.close();
+            }
             ui.separator();
         }
         let selected = ui
@@ -446,7 +452,9 @@ pub(super) fn diff_editor(ui: &mut egui::Ui, id: egui::Id, text: &mut String, co
 }
 pub fn forget_editor(ctx: &egui::Context, id: egui::Id) {
     ctx.data_mut(|data| {
-        data.remove::<std::sync::Arc<std::sync::Mutex<UndoHistory>>>(id.with("undo-text"))
+        data.remove::<std::sync::Arc<std::sync::Mutex<UndoHistory>>>(id.with("undo-text"));
+        data.remove::<Result<RequestSource, String>>(id.with("request-source"));
+        data.remove::<String>(id.with("context-selection"));
     });
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
         state.clear_undoer();

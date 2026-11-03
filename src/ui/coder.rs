@@ -3,6 +3,8 @@ use crate::coder::{self, Codec};
 
 #[derive(Default)]
 pub(super) struct Coder {
+    jwt_mode: bool,
+    jwt: super::jwt::Workbench,
     input: String,
     input_hex: bool,
     output: Vec<u8>,
@@ -15,6 +17,12 @@ pub(super) struct Coder {
 }
 impl Coder {
     pub(super) fn load(&mut self, text: String) {
+        if crate::jwt::parse(&text).is_ok() {
+            self.jwt_mode = true;
+            self.jwt.load(text);
+            return;
+        }
+        self.jwt_mode = false;
         self.input = text;
         self.input_hex = false;
         self.clear_output();
@@ -80,8 +88,13 @@ impl Coder {
         }
         ui.horizontal_wrapped(|ui| {
             ui.heading("Coder");
-            ui.weak("Select text in an editor, right-click, then Send selection to Coder.");
+            ui.selectable_value(&mut self.jwt_mode, false, "Encoders");
+            ui.selectable_value(&mut self.jwt_mode, true, "JWT workbench");
         });
+        if self.jwt_mode {
+            self.jwt.page(ui);
+            return;
+        }
         ui.horizontal_wrapped(|ui| {
             let mut codec = self.codec.unwrap_or(Codec::Base64);
             egui::ComboBox::from_id_salt("coder-codec")
@@ -236,6 +249,40 @@ impl Spike {
                 Err(error) => self.workflow.message = error,
             }
             ctx.request_repaint();
+        }
+        let attack_request = ctx.data_mut(|data| {
+            let key = egui::Id::new("attack-request-transfer");
+            let value = data.get_temp::<Result<syntax::RequestSource, String>>(key);
+            data.remove::<Result<syntax::RequestSource, String>>(key);
+            value
+        });
+        if let Some(source) = attack_request {
+            match source {
+                Ok(source) => {
+                    let request = crate::state::SavedRequest {
+                        name: "Request".into(),
+                        group: String::new(),
+                        timeout_secs: 0,
+                        destination: source.destination,
+                        request: source.request,
+                    };
+                    match self.attack.load(vec![request]) {
+                        Ok(()) => self.workflow.tab = Tab::Attack,
+                        Err(error) => self.workflow.message = error,
+                    }
+                }
+                Err(error) => self.workflow.message = error,
+            }
+        }
+        if let Some(requests) = ctx.data_mut(|data| {
+            data.remove_temp::<Vec<crate::state::SavedRequest>>(egui::Id::new(
+                "attack-group-transfer",
+            ))
+        }) {
+            match self.attack.load(requests) {
+                Ok(()) => self.workflow.tab = Tab::Attack,
+                Err(error) => self.workflow.message = error,
+            }
         }
         if let Some(text) = syntax::take_coder_selection(ctx) {
             self.coder.load(text);
