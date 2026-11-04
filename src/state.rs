@@ -171,6 +171,21 @@ impl ScopeRule {
             && (self.path.is_empty() || url.path().starts_with(&self.path))
     }
 }
+/// Registrable site domain from the bundled Public Suffix List, including private suffixes.
+/// Includes private boundaries; unknown CTF suffixes use the list's default rule.
+/// IPs, single-label names and bare public suffixes have no site-domain target.
+pub fn site_domain(host: &str) -> Option<String> {
+    let url::Host::Domain(host) = url::Host::parse(host.trim().trim_end_matches('.')).ok()? else {
+        return None;
+    };
+    if host.contains('*') {
+        return None;
+    }
+    let domain = psl::domain(host.as_bytes())?;
+    std::str::from_utf8(domain.as_bytes())
+        .ok()
+        .map(str::to_owned)
+}
 pub fn in_scope(rules: &[ScopeRule], target: &str) -> bool {
     let Ok(url) = url::Url::parse(target) else {
         return false;
@@ -572,6 +587,51 @@ pub fn protocol_parts(protocol: &str) -> (&str, Option<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn site_domain_respects_public_and_private_suffix_boundaries() {
+        for (host, site) in [
+            ("sub.domain.com", "domain.com"),
+            ("api.shop.example.co.uk", "example.co.uk"),
+            ("WWW.EXAMPLE.COM.", "example.com"),
+            ("api.lab.htb", "lab.htb"),
+            ("api.lab.internal", "lab.internal"),
+            ("lab.example.test", "example.test"),
+            ("www.alice.github.io", "alice.github.io"),
+            ("api.alice.appspot.com", "alice.appspot.com"),
+            ("www.city.kawasaki.jp", "city.kawasaki.jp"),
+            ("www.食狮.com.cn", "xn--85x722f.com.cn"),
+        ] {
+            assert_eq!(site_domain(host).as_deref(), Some(site), "{host}");
+        }
+        for host in [
+            "com",
+            "co.uk",
+            "github.io",
+            "localhost",
+            "127.0.0.1",
+            "[::1]",
+            "*.example.com",
+            "https://example.com/path",
+        ] {
+            assert!(
+                site_domain(host).is_none(),
+                "Unexpected site domain for {host}"
+            );
+        }
+        let mut state = ProjectState::default();
+        let site = site_domain("api.shop.example.co.uk").unwrap();
+        state.include_host(&site, false).unwrap();
+        assert!(in_scope(&state.scope, "https://example.co.uk/"));
+        assert!(!in_scope(&state.scope, "https://api.shop.example.co.uk/"));
+        state.include_host(&site, true).unwrap();
+        assert!(in_scope(&state.scope, "https://api.shop.example.co.uk/"));
+        assert!(!in_scope(&state.scope, "https://unrelated.co.uk/"));
+        assert_eq!(state.scope.len(), 1);
+        let site = site_domain("www.alice.github.io").unwrap();
+        state.include_host(&site, true).unwrap();
+        assert!(in_scope(&state.scope, "https://api.alice.github.io/"));
+        assert!(!in_scope(&state.scope, "https://bob.github.io/"));
+    }
     #[test]
     fn adding_hosts_to_scope_is_explicit_additive_and_deduplicated() {
         let mut state = ProjectState::default();

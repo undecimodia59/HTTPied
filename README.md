@@ -127,9 +127,15 @@ local archive and checksum in `dist/`. Packages are unsigned; Windows runtime an
 Wayland interaction still require platform testing.
 
 Request and response context menus offer **Add to scope → Host only / Host + subdomains**.
-The hostname comes from the actual exchange target. Existing inclusions are reused or expanded;
-explicit exclusions and restricted rules remain intact. Host + subdomains includes the chosen
-host and its children, and does not automatically broaden scope to a parent domain.
+For subdomains, **Site domain only / Site domain + subdomains** also let you add the registrable
+site domain, for example `domain.com` from `sub.domain.com`, or `example.co.uk` from
+`shop.example.co.uk`. The menu shows both target names before you choose. Site-domain lookup uses
+a bundled Public Suffix List, including private suffixes such as `github.io`, without network
+requests. Equivalent site actions are omitted when the host already is the site domain; IPs and
+single-label local names keep the host actions. Unknown suffixes follow the list's default rule,
+so CTF names such as `api.lab.htb` resolve to `lab.htb`. Subdomain options include the named host
+and its children. Existing inclusions are reused or expanded; explicit exclusions and restricted
+rules remain intact.
 
 Settings is the last workspace tab. Enable **Settings → Appearance → Wrap long lines by default**
 to wrap all message editors; individual panes also have a Wrap control/context-menu option.

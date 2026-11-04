@@ -33,22 +33,30 @@ pub(super) fn register_scope(ui: &egui::Ui, id: egui::Id, target: Option<&str>) 
 pub(super) fn scope_menu(ui: &mut egui::Ui, host: &str) {
     ui.menu_button("Add to scope", |ui| {
         ui.monospace(host);
-        for (label, subdomains) in [("Host only", false), ("Host + subdomains", true)] {
-            let domain = matches!(url::Host::parse(host), Ok(url::Host::Domain(_)));
-            if ui
-                .add_enabled(!subdomains || domain, egui::Button::new(label))
-                .clicked()
-            {
-                ui.ctx().data_mut(|data| {
-                    data.insert_temp(
-                        egui::Id::new("scope-add-host"),
-                        (host.to_owned(), subdomains),
-                    )
-                });
-                ui.close();
-            }
+        let domain = matches!(url::Host::parse(host), Ok(url::Host::Domain(_)));
+        scope_option(ui, "Host only", host, false, true);
+        scope_option(ui, "Host + subdomains", host, true, domain);
+        if let Some(site) = crate::state::site_domain(host)
+            && !site.eq_ignore_ascii_case(host.trim_end_matches('.'))
+        {
+            ui.separator();
+            ui.weak("Site domain");
+            ui.monospace(&site);
+            scope_option(ui, "Site domain only", &site, false, true);
+            scope_option(ui, "Site domain + subdomains", &site, true, true);
         }
     });
+}
+fn scope_option(ui: &mut egui::Ui, label: &str, host: &str, subdomains: bool, enabled: bool) {
+    if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("scope-add-host"),
+                (host.to_owned(), subdomains),
+            )
+        });
+        ui.close();
+    }
 }
 pub(super) fn set_default_wrap(ctx: &egui::Context, value: bool) {
     ctx.data_mut(|data| {
@@ -505,6 +513,74 @@ pub fn forget_editor(ctx: &egui::Context, id: egui::Id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn site_scope_menu_queues_the_displayed_domain_and_selected_breadth() {
+        for (label, subdomains) in [
+            ("Site domain only", false),
+            ("Site domain + subdomains", true),
+        ] {
+            let ctx = egui::Context::default();
+            let draw = |events: Vec<egui::Event>| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(940.0, 700.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| scope_menu(ui, "api.shop.example.co.uk"),
+                );
+                let texts = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) => Some((
+                            text.galley.text().to_owned(),
+                            text.pos + text.galley.size() * 0.5,
+                        )),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                output.textures_delta.clear();
+                texts
+            };
+            let click = |point: egui::Pos2| {
+                draw(vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+                draw(vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }])
+            };
+            let point = draw(vec![])
+                .into_iter()
+                .find(|(text, _)| text == "Add to scope")
+                .unwrap()
+                .1;
+            click(point);
+            let items = draw(vec![]);
+            assert!(items.iter().any(|(text, _)| text == "example.co.uk"));
+            let point = items.into_iter().find(|(text, _)| text == label).unwrap().1;
+            click(point);
+            assert_eq!(
+                ctx.data_mut(
+                    |data| data.remove_temp::<(String, bool)>(egui::Id::new("scope-add-host"))
+                ),
+                Some(("example.co.uk".into(), subdomains))
+            );
+        }
+    }
     #[test]
     fn wrapping_reflows_long_lines_without_changing_message_bytes() {
         let ctx = egui::Context::default();
