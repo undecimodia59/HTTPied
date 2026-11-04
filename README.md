@@ -60,7 +60,7 @@ JWT inputs, output and signing keys are session-only.
 Select text with the mouse or **Shift+arrows**, right-click, and choose **Send selection to Coder**.
 Coder (**Ctrl+5**) supports Base64, Base64url, URL percent, form, HTML entities and hex. Binary
 results stay as exact bytes with a hex view; **Use as input** chains a result into another operation.
-Coder data is session-only. In a message editor, **Set Compare baseline** followed by **Compare
+Encoder input, input format, codec, last encode/decode choice and result view are saved with the project. In a message editor, **Set Compare baseline** followed by **Compare
 with baseline** opens the paired, highlighted comparison (**Ctrl+6**) with synchronized scrolling.
 You can also paste two messages directly into Compare.
 
@@ -125,6 +125,11 @@ The trust smoke also requires Chromium and OpenSSL. Both use isolated test trust
 Use `bash scripts/package-linux.sh` or `./scripts/package-windows.ps1` to create a
 local archive and checksum in `dist/`. Packages are unsigned; Windows runtime and
 Wayland interaction still require platform testing.
+
+Request and response context menus offer **Add to scope → Host only / Host + subdomains**.
+The hostname comes from the actual exchange target. Existing inclusions are reused or expanded;
+explicit exclusions and restricted rules remain intact. Host + subdomains includes the chosen
+host and its children, and does not automatically broaden scope to a parent domain.
 
 Settings is the last workspace tab. Enable **Settings → Appearance → Wrap long lines by default**
 to wrap all message editors; individual panes also have a Wrap control/context-menu option.

@@ -898,9 +898,11 @@ impl Spike {
         let list_max = (ui.available_height() - 260.0).max(140.0);
         let list_min = (70.0 + 35.0 * self.visible_ids().len().min(4) as f32).clamp(130.0, 210.0);
         egui::Panel::top("history-list").resizable(true).default_size(220.0).min_size(list_min).max_size(list_max).show(ui,|ui| {
-        let rows_height=(ui.available_height()-52.0).max(70.0);
+        // Keep the user's requested split even when the table is empty or short.
+        ui.set_min_height(ui.available_height());
         card().show(ui, |ui| {
-            let width = ui.available_width();
+            let table_height = ui.available_height();
+            let width = ui.available_width() - ui.spacing().scroll.allocated_width();
             let layout = column_layout(
                 &self.features.state.columns,
                 &self.features.state.column_widths,
@@ -915,6 +917,7 @@ impl Spike {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_width(width);
+                    let table_top = ui.cursor().min.y;
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
                     for (column, start, span, title) in &layout {
@@ -992,11 +995,13 @@ impl Spike {
                     }
                     ui.separator();
                     let ids = self.visible_ids();
-                    let height = rows_height;
+                    let height = (table_height - (ui.cursor().min.y - table_top)
+                        - ui.spacing().scroll.allocated_width() - ui.spacing().item_spacing.y).max(40.0);
                     let mut area = egui::ScrollArea::vertical()
                         .id_salt("history-rows")
-                        .min_scrolled_height(height)
-                        .max_height(height);
+                        .min_scrolled_height(40.0)
+                        .max_height(height)
+                        .auto_shrink([false, false]);
                     if self.scroll_selection {
                         if let Some(index) = ids.iter().position(|id| Some(*id) == self.selected) {
                             area = area.vertical_scroll_offset(
@@ -1005,6 +1010,7 @@ impl Spike {
                         }
                         self.scroll_selection = false;
                     }
+                    if !ids.is_empty() {
                     area.show_rows(ui, 28.0, ids.len(), |ui, range| {
                         for row in range {
                             let entry = self
@@ -1046,6 +1052,9 @@ impl Spike {
                                         ui.close();
                                     }
                                     if ui.button("Send to Attack").clicked() {send_to=Some((entry.id,Tab::Attack));ui.close();}
+                                    if let Ok(target)=url::Url::parse(&execution.parsed.target) && let Some(host)=target.host() {
+                                        syntax::scope_menu(ui,&host.to_string());
+                                    }
                                     if ui.button("Copy URL").clicked() {
                                         ui.ctx().copy_text(execution.parsed.target.clone());
                                         self.toast =
@@ -1058,7 +1067,7 @@ impl Spike {
                             });
                         }
                     });
-                    if ids.is_empty() {
+                    } else {
                         ui.label(
                             if self.history.entries.is_empty() && self.features.total == 0 {
                                 "No captured requests"
@@ -1223,6 +1232,18 @@ impl Spike {
             )
         });
         syntax::register_request(ui, editor_id, source);
+        let target = self
+            .history
+            .entries
+            .iter()
+            .find_map(|entry| match &entry.event {
+                Event::Exchange(execution) if Some(entry.id) == self.selected => {
+                    Some(execution.parsed.target.as_str())
+                }
+                _ => None,
+            });
+        syntax::register_scope(ui, editor_id, target);
+
         syntax::wrap_control(ui, editor_id);
         card().show(ui, |ui| {
             let height = (ui.available_height() - 95.0).max(90.0);
@@ -1539,6 +1560,77 @@ mod tests {
         app.sort_descending = false;
         assert_eq!(app.visible_ids(), vec![2, 1, 3]);
         assert_eq!(app.selected, selected);
+    }
+    #[test]
+    fn history_preview_keeps_the_split_after_dragging() {
+        for count in [0, 8, 128] {
+            let (_tx, rx) = mpsc::channel(1);
+            let mut app = Spike::new(rx, "127.0.0.1:8080".parse().unwrap());
+            for _ in 0..count {
+                app.receive(exchange());
+            }
+            app.features.open = true;
+            app.workflow.tab = Tab::History;
+            let context = egui::Context::default();
+            theme(&context);
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1240.0, 860.0));
+            let panel = egui::Id::new("history-list");
+            let mut frame = |events: Vec<egui::Event>| {
+                let mut output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(viewport),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.content(ui),
+                );
+                output.textures_delta.clear();
+                egui::containers::panel::PanelState::load(&context, panel)
+                    .unwrap()
+                    .outer_rect
+            };
+            frame(vec![]);
+            let seeded = egui::Rect::from_min_size(frame(vec![]).min, egui::vec2(1240.0, 390.0));
+            context.data_mut(|data| {
+                data.insert_persisted(
+                    panel,
+                    egui::containers::panel::PanelState { outer_rect: seeded },
+                )
+            });
+            let before = frame(vec![]);
+            let start = egui::pos2(450.0, before.bottom() - 1.0);
+            frame(vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            let end = start - egui::vec2(0.0, 100.0);
+            frame(vec![egui::Event::PointerMoved(end)]);
+            let after = frame(vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let mut heights = vec![after.height()];
+            for _ in 0..12 {
+                heights.push(frame(vec![]).height());
+            }
+            assert!(
+                after.height() < before.height() - 50.0,
+                "History divider did not move for {count} rows: {before:?} -> {after:?}"
+            );
+            assert!(
+                heights
+                    .iter()
+                    .all(|height| (height - after.height()).abs() < 2.0),
+                "History split drifted after dragging with {count} rows: {heights:?}"
+            );
+        }
     }
     #[test]
     fn history_layout_at_supported_sizes() {

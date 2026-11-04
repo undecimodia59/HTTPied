@@ -396,6 +396,7 @@ pub struct ProjectState {
     pub replay_groups: Vec<String>,
     pub selected_replay: usize,
     pub attack_workspace: crate::campaign::Workspace,
+    pub coder_workspace: crate::coder::Workspace,
     pub columns: Vec<String>,
     pub column_widths: BTreeMap<String, f32>,
     pub rules: Vec<RewriteRule>,
@@ -406,6 +407,35 @@ pub struct ProjectState {
     pub intercept_mime: String,
 }
 impl ProjectState {
+    pub fn include_host(&mut self, host: &str, subdomains: bool) -> Result<(String, bool), String> {
+        let parsed = url::Host::parse(host.trim().trim_end_matches('.'))
+            .map_err(|_| "Invalid scope host".to_owned())?;
+        let subdomains = subdomains && matches!(&parsed, url::Host::Domain(_));
+        let host = parsed.to_string().to_ascii_lowercase();
+        for rule in &mut self.scope {
+            if !rule.exclude
+                && rule.scheme.is_empty()
+                && rule.port.is_empty()
+                && rule.path.is_empty()
+                && url::Host::parse(rule.host.trim().trim_end_matches('.'))
+                    .ok()
+                    .is_some_and(|value| value.to_string().eq_ignore_ascii_case(&host))
+            {
+                let changed = subdomains && !rule.subdomains;
+                rule.subdomains |= subdomains;
+                return Ok((host, changed));
+            }
+        }
+        if self.scope.len() >= 256 {
+            return Err("Scope has 256 rules. Remove a rule before adding another host.".into());
+        }
+        self.scope.push(ScopeRule {
+            host: host.clone(),
+            subdomains,
+            ..Default::default()
+        });
+        Ok((host, true))
+    }
     pub fn migrate_scope(&mut self) {
         if self.scope_behavior == 0 {
             if !self.settings.enforce_scope {
@@ -420,6 +450,7 @@ impl ProjectState {
     }
     pub fn validate(&self) -> Result<(), String> {
         self.settings.validate()?;
+        self.coder_workspace.validate()?;
         // An empty Attack workspace is valid before a request has been sent to it.
         self.attack_workspace.validate_storage()?;
         if self.column_widths.len() > 32
@@ -491,6 +522,7 @@ impl Default for ProjectState {
             replay_groups: vec![],
             selected_replay: 0,
             attack_workspace: Default::default(),
+            coder_workspace: Default::default(),
             columns: [
                 "#", "Method", "Status", "Protocol", "Host", "Endpoint", "Duration", "Size",
             ]
@@ -540,6 +572,32 @@ pub fn protocol_parts(protocol: &str) -> (&str, Option<u32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adding_hosts_to_scope_is_explicit_additive_and_deduplicated() {
+        let mut state = ProjectState::default();
+        state.include_host("EXAMPLE.test.", false).unwrap();
+        assert!(in_scope(&state.scope, "https://example.test/"));
+        assert!(!in_scope(&state.scope, "https://child.example.test/"));
+        state.include_host("example.test", true).unwrap();
+        assert_eq!(state.scope.len(), 1);
+        assert!(in_scope(&state.scope, "https://deep.child.example.test/"));
+        assert!(!in_scope(&state.scope, "https://notexample.test/"));
+        state.include_host("example.test", false).unwrap();
+        assert!(state.scope[0].subdomains);
+        state.scope.push(ScopeRule {
+            host: "blocked.example.test".into(),
+            exclude: true,
+            ..Default::default()
+        });
+        state.include_host("blocked.example.test", false).unwrap();
+        assert!(!in_scope(&state.scope, "https://blocked.example.test/"));
+        assert!(state.scope[1].exclude);
+        state.include_host("127.0.0.1", true).unwrap();
+        assert!(!state.scope.last().unwrap().subdomains);
+        state.include_host("[::1]", false).unwrap();
+        assert!(in_scope(&state.scope, "http://[::1]:8080/"));
+        assert!(state.include_host("https://other.test/path", true).is_err());
+    }
     #[test]
     fn wrapping_defaults_for_older_projects_and_survives_persistence() {
         let old: Settings = serde_json::from_str("{}").unwrap();

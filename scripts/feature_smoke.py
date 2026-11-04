@@ -347,6 +347,8 @@ def main():
                             time.sleep(.5)
                             height=int(subprocess.check_output(["identify","-format","%h",str(destination/"ui-capture.png")]))
                             click(30,height-14);shot("glow-logs.png");click(30,height-14)
+                            from followup_smoke import exercise as followup_exercise
+                            followup_exercise(click,paste,shot,hotkey,wait_path,origin,project_path,display_name)
                             # Inspect every task at the minimum supported window size.
                             lib.XResizeWindow.argtypes=[c.c_void_p,c.c_ulong,c.c_uint,c.c_uint]
                             lib.XResizeWindow(display,window,940,700);lib.XFlush(display);time.sleep(.4)
@@ -370,6 +372,8 @@ def main():
                     with sqlite3.connect(project_path/"project.sqlite") as database:
                         state=json.loads(database.execute("SELECT json FROM state WHERE id=1").fetchone()[0])
                         assert state["settings"]["wrap_lines"] is True,state["settings"]
+                        from followup_smoke import verify_state
+                        verify_state(state)
                         assert "{{route}}" in state["replays"][0]["request"],state["replays"]
                         assert state["variables"][0]["key"]=="route" and state["variables"][0]["value"]=="/glow-replay",state["variables"]
                         records=[json.loads(row[0]) for row in database.execute("SELECT json FROM results ORDER BY idx")]
@@ -404,6 +408,8 @@ def main():
                     else:raise RuntimeError("saved project failed to reopen")
                     hotkey("2");click(75,222);shot("glow-recovered-replay.png")
                     hotkey("Return");wait_path("/glow-replay")
+                    from followup_smoke import verify_reopened
+                    verify_reopened(click,hotkey,shot,display_name)
                     event.message.window=window;lib.XSendEvent(display,window,0,0,c.byref(event));lib.XFlush(display)
                     assert app.wait(timeout=5)==0
                     print("PASS: saved project reopened and recovered variable-driven Replay executed")

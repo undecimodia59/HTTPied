@@ -13,6 +13,7 @@ pub(super) struct Coder {
     error: String,
     completed: String,
     codec: Option<Codec>,
+    operation: coder::Operation,
     reset_editor: bool,
 }
 impl Coder {
@@ -25,6 +26,36 @@ impl Coder {
         self.jwt_mode = false;
         self.input = text;
         self.input_hex = false;
+        self.clear_output();
+        self.reset_editor = true;
+    }
+    pub(super) fn saved_workspace(&self) -> coder::Workspace {
+        coder::Workspace {
+            input: self.input.clone(),
+            input_hex: self.input_hex,
+            codec: self.codec.unwrap_or_default(),
+            operation: self.operation,
+            output_hex: self.output_hex,
+            converted: !self.completed.is_empty() || !self.error.is_empty(),
+        }
+    }
+    pub(super) fn restore(&mut self, saved: &coder::Workspace) {
+        self.jwt_mode = false;
+        self.input = saved.input.clone();
+        self.input_hex = saved.input_hex;
+        self.codec = Some(saved.codec);
+        self.operation = saved.operation;
+        self.clear_output();
+        self.output_hex = saved.output_hex;
+        if saved.converted {
+            self.convert(saved.operation == coder::Operation::Encode);
+            self.output_hex = saved.output_hex || std::str::from_utf8(&self.output).is_err();
+            self.refresh_output();
+        }
+        self.reset_editor = true;
+    }
+    fn clear_input(&mut self) {
+        self.input.clear();
         self.clear_output();
         self.reset_editor = true;
     }
@@ -43,6 +74,11 @@ impl Coder {
         };
     }
     fn convert(&mut self, encode: bool) {
+        self.operation = if encode {
+            coder::Operation::Encode
+        } else {
+            coder::Operation::Decode
+        };
         self.clear_output();
         let input = if self.input_hex {
             coder::unhex(&self.input)
@@ -108,16 +144,28 @@ impl Coder {
                 self.codec = Some(codec);
                 self.clear_output();
             }
-            if primary(ui, true, "Decode").clicked() {
+            if (if self.operation == coder::Operation::Decode {
+                primary(ui, true, "Decode")
+            } else {
+                ui.button("Decode")
+            })
+            .clicked()
+            {
                 self.convert(false);
             }
-            if ui.button("Encode").clicked() {
+            if (if self.operation == coder::Operation::Encode {
+                primary(ui, true, "Encode")
+            } else {
+                ui.button("Encode")
+            })
+            .clicked()
+            {
                 self.convert(true);
             }
             if ui.button("Clear").clicked() {
-                self.load(String::new());
+                self.clear_input();
             }
-            ui.weak("128 KiB input · session only");
+            ui.weak("128 KiB input · saved with project");
         });
         if !self.error.is_empty() {
             ui.colored_label(ERROR, &self.error);
@@ -228,6 +276,29 @@ impl Spike {
         self.coder.page(ui);
     }
     pub(super) fn receive_coder_selection(&mut self, ctx: &egui::Context) {
+        if let Some((host, subdomains)) =
+            ctx.data_mut(|data| data.remove_temp::<(String, bool)>(egui::Id::new("scope-add-host")))
+        {
+            match self.features.state.include_host(&host, subdomains) {
+                Ok((host, changed)) => {
+                    self.toast = Some((
+                        format!(
+                            "{} {}{}",
+                            if changed {
+                                "Added to scope:"
+                            } else {
+                                "Already in scope:"
+                            },
+                            host,
+                            if subdomains { " + subdomains" } else { "" }
+                        ),
+                        std::time::Instant::now(),
+                    ))
+                }
+                Err(error) => self.features.message = error,
+            }
+        }
+
         let transfer = ctx.data_mut(|data| {
             let key = egui::Id::new("request-transfer");
             let value = data.get_temp::<(bool, Result<syntax::RequestSource, String>)>(key);
@@ -309,6 +380,59 @@ impl Spike {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restored_workspace_keeps_input_codec_direction_and_binary_output() {
+        let mut coder = Coder {
+            input: "68 69".into(),
+            input_hex: true,
+            codec: Some(Codec::Base64Url),
+            ..Default::default()
+        };
+        coder.convert(true);
+        coder.output_hex = true;
+        coder.refresh_output();
+        let saved: crate::state::ProjectState = serde_json::from_str(
+            &serde_json::to_string(&crate::state::ProjectState {
+                coder_workspace: coder.saved_workspace(),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut restored = Coder::default();
+        restored.restore(&saved.coder_workspace);
+        assert_eq!(restored.input, "68 69");
+        assert!(restored.input_hex && restored.output_hex);
+        assert_eq!(restored.codec, Some(Codec::Base64Url));
+        assert_eq!(restored.operation, coder::Operation::Encode);
+        assert_eq!(restored.output, b"aGk");
+        restored.clear_input();
+        assert!(restored.input.is_empty() && restored.output.is_empty());
+        assert!(restored.input_hex);
+        assert_eq!(restored.operation, coder::Operation::Encode);
+        coder.input = "ff0061".into();
+        coder.input_hex = false;
+        coder.codec = Some(Codec::Hex);
+        coder.convert(false);
+        restored.restore(&coder.saved_workspace());
+        assert_eq!(restored.output, vec![255, 0, 97]);
+        assert!(restored.output_hex);
+        assert_eq!(restored.operation, coder::Operation::Decode);
+        coder.input = "edited but not converted".into();
+        coder.clear_output();
+        restored.restore(&coder.saved_workspace());
+        assert!(restored.output.is_empty());
+        assert_eq!(restored.input, "edited but not converted");
+    }
+    #[test]
+    fn old_projects_open_with_default_coder_preferences() {
+        let state: crate::state::ProjectState = serde_json::from_str("{}").unwrap();
+        let mut coder = Coder::default();
+        coder.restore(&state.coder_workspace);
+        assert!(coder.input.is_empty() && coder.output.is_empty());
+        assert_eq!(coder.codec, Some(Codec::Base64));
+        assert_eq!(coder.operation, coder::Operation::Decode);
+    }
     #[test]
     fn binary_chaining_is_lossless_and_failed_conversions_clear_old_output() {
         let mut coder = Coder::default();

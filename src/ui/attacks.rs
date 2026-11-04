@@ -531,6 +531,9 @@ impl Spike {
             });
             let id = egui::Id::new(("attack-step", self.attack.editor_ids[index]));
             syntax::wrap_control(ui, id);
+            let target =
+                crate::state::resolve(&step.destination, &self.features.state.variables).ok();
+            syntax::register_scope(ui, id, target.as_deref());
             syntax::register_request(
                 ui,
                 id,

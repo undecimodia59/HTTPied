@@ -1857,6 +1857,15 @@ mod tests {
             secret: false,
             enabled: true,
         });
+        project.state.coder_workspace = crate::coder::Workspace {
+            input: "68 69".into(),
+            input_hex: true,
+            codec: crate::coder::Codec::Base64Url,
+            operation: crate::coder::Operation::Encode,
+            converted: true,
+            output_hex: false,
+        };
+        let saved_coder = project.state.coder_workspace.clone();
         project.save().unwrap();
         project.store(1, &Event::Error("test".into())).unwrap();
         // Model a descriptor inherited by a child between fork and exec.
@@ -1867,6 +1876,7 @@ mod tests {
         #[cfg(unix)]
         drop(inherited_lock);
         assert_eq!(project.state.variables[0].value, "local");
+        assert_eq!(project.state.coder_workspace, saved_coder);
         assert_eq!(project.total().unwrap(), 0);
         assert_eq!(project.logs().unwrap()[0].message, "test");
         drop(project);

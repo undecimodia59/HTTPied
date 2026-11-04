@@ -768,6 +768,7 @@ impl Workflow {
                     .max_height((ui.available_height() - 100.0).max(180.0))
                     .show(ui, |ui| {
                         let id = egui::Id::new(("held", held.pending.id));
+                        syntax::register_scope(ui,id,Some(&held.pending.destination));
                         syntax::register_request(
                             ui,
                             id,
@@ -1197,6 +1198,12 @@ impl Workflow {
                     .max_height(height)
                     .min_scrolled_height(height)
                     .show(ui, |ui| {
+                        let target = crate::state::resolve(&tool.destination, &self.variables).ok();
+                        syntax::register_scope(
+                            ui,
+                            egui::Id::new(("request", tool.editor_id)),
+                            target.as_deref(),
+                        );
                         syntax::register_request(
                             ui,
                             egui::Id::new(("request", tool.editor_id)),
@@ -1308,6 +1315,11 @@ impl Workflow {
                 area.max_height(height)
                     .min_scrolled_height(height)
                     .show(ui, |ui| {
+                        syntax::register_scope(
+                            ui,
+                            egui::Id::new(("response", tool.editor_id)),
+                            Some(&tool.last_target),
+                        );
                         syntax::editor(
                             ui,
                             egui::Id::new(("response", tool.editor_id)),

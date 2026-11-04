@@ -1,16 +1,41 @@
-//! Bounded byte-preserving transformations for the session-only Coder workspace.
+//! Bounded byte-preserving transformations and saved Coder preferences.
 use base64::{Engine, engine::general_purpose};
 pub const INPUT_LIMIT: usize = 128 * 1024;
 pub const OUTPUT_LIMIT: usize = 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Codec {
+    #[default]
     Base64,
     Base64Url,
     Url,
     Form,
     Html,
     Hex,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Operation {
+    #[default]
+    Decode,
+    Encode,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Workspace {
+    pub input: String,
+    pub input_hex: bool,
+    pub codec: Codec,
+    pub operation: Operation,
+    pub output_hex: bool,
+    pub converted: bool,
+}
+impl Workspace {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.input.len() > 16 * INPUT_LIMIT {
+            return Err("Saved Coder input exceeds the editor limit".into());
+        }
+        Ok(())
+    }
 }
 impl Codec {
     pub const ALL: [Self; 6] = [

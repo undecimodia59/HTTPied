@@ -255,6 +255,7 @@ impl Spike {
                 let editor = egui::Id::new(("history-request", id));
                 syntax::wrap_control(ui, editor);
                 syntax::register_request(ui, editor, Some(self.inspect.source.clone()));
+                syntax::register_scope(ui, editor, Some(&url));
                 let jump = find(
                     ui,
                     editor,
@@ -304,6 +305,7 @@ impl Spike {
                     }
                 });
                 let editor = egui::Id::new(("history-response", id));
+                syntax::register_scope(ui, editor, Some(&url));
                 syntax::wrap_control(ui, editor);
                 let jump = find(
                     ui,

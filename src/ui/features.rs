@@ -323,6 +323,7 @@ impl Spike {
                     self.history.row_limit = self.features.state.settings.retain_rows;
                     self.replace_page(rows);
                     self.workflow.restore(&self.features.state);
+                    self.coder.restore(&self.features.state.coder_workspace);
                     self.attack.workspace = self.features.state.attack_workspace.clone();
                     self.project_command(Command::CampaignList);
                     self.install_trust();
@@ -519,6 +520,7 @@ impl Spike {
             self.features.state.replays = self.workflow.saved_requests();
             self.workflow.save_group_state(&mut self.features.state);
             self.features.state.attack_workspace = self.attack.workspace.clone();
+            self.features.state.coder_workspace = self.coder.saved_workspace();
             let snapshot = serde_json::to_string(&self.features.state).unwrap_or_default();
             if snapshot != self.features.saved {
                 if let Some(policy) = &self.features.policy {
@@ -1530,6 +1532,7 @@ impl Drop for Spike {
             self.features.state.replays = self.workflow.saved_requests();
             self.workflow.save_group_state(&mut self.features.state);
             self.features.state.attack_workspace = self.attack.workspace.clone();
+            self.features.state.coder_workspace = self.coder.saved_workspace();
             if self.features.state.settings.validate().is_ok() {
                 self.features
                     .pending

@@ -17,6 +17,39 @@ pub(super) fn register_request(
         }
     });
 }
+/// Target metadata is independent of the displayed bytes, especially for responses.
+pub(super) fn register_scope(ui: &egui::Ui, id: egui::Id, target: Option<&str>) {
+    let host = target
+        .and_then(|target| url::Url::parse(target).ok())
+        .filter(|url| matches!(url.scheme(), "http" | "https"))
+        .and_then(|url| url.host().map(|host| host.to_string()));
+    ui.ctx().data_mut(|data| {
+        data.remove::<String>(id.with("scope-host"));
+        if let Some(host) = host {
+            data.insert_temp(id.with("scope-host"), host);
+        }
+    });
+}
+pub(super) fn scope_menu(ui: &mut egui::Ui, host: &str) {
+    ui.menu_button("Add to scope", |ui| {
+        ui.monospace(host);
+        for (label, subdomains) in [("Host only", false), ("Host + subdomains", true)] {
+            let domain = matches!(url::Host::parse(host), Ok(url::Host::Domain(_)));
+            if ui
+                .add_enabled(!subdomains || domain, egui::Button::new(label))
+                .clicked()
+            {
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new("scope-add-host"),
+                        (host.to_owned(), subdomains),
+                    )
+                });
+                ui.close();
+            }
+        }
+    });
+}
 pub(super) fn set_default_wrap(ctx: &egui::Context, value: bool) {
     ctx.data_mut(|data| {
         let key = egui::Id::new("editor-wrap-default");
@@ -440,6 +473,13 @@ fn selection_menu(
         }
         ui.separator();
         wrap_control(ui, id);
+        if let Some(host) = ui
+            .ctx()
+            .data(|data| data.get_temp::<String>(id.with("scope-host")))
+        {
+            ui.separator();
+            scope_menu(ui, &host);
+        }
     });
 }
 pub(super) fn take_coder_selection(ctx: &egui::Context) -> Option<String> {
@@ -455,6 +495,7 @@ pub fn forget_editor(ctx: &egui::Context, id: egui::Id) {
         data.remove::<std::sync::Arc<std::sync::Mutex<UndoHistory>>>(id.with("undo-text"));
         data.remove::<Result<RequestSource, String>>(id.with("request-source"));
         data.remove::<String>(id.with("context-selection"));
+        data.remove::<String>(id.with("scope-host"));
     });
     if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
         state.clear_undoer();
