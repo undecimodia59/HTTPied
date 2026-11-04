@@ -202,7 +202,7 @@ fn body(job: &mut LayoutJob, mut text: &str) {
             text = &text[1..];
             continue;
         }
-        if (in_tag || first == '"') && (first == '\'' || first == '"') {
+        if first == '"' || (in_tag && first == '\'') {
             let tail = &text[1..];
             let mut escaped = false;
             let mut end = text.len();

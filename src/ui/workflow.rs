@@ -857,10 +857,10 @@ impl Workflow {
             );
             send = primary(
                 ui,
-                !busy
-                    && !(tab == Tab::Intruder
+                !(busy
+                    || (tab == Tab::Intruder
                         && self.payload_mode == PayloadMode::File
-                        && self.file_busy),
+                        && self.file_busy)),
                 if tab == Tab::Replay {
                     "Send  Ctrl+Enter"
                 } else {
