@@ -16,12 +16,27 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
       - run: cargo test --locked --all-features
-      - if: runner.os == 'Linux'
-        run: bash scripts/package-linux.sh
       - if: runner.os == 'Windows'
         shell: pwsh
         run: ./scripts/package-windows.ps1
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
         with:
           name: httpied-${{ runner.os }}
+          path: dist/*
+  linux-package:
+    needs: check
+    runs-on: ubuntu-latest
+    # The build's libc determines the minimum runtime libc, independently of Rust.
+    container: rust:1.95.0-trixie
+    steps:
+      - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libnss3-tools
+      - run: cargo test --locked --all-features
+      - run: bash scripts/package-linux.sh
+      # Load the packaged executable with Trixie's runtime, without needing a display.
+      - run: ./target/release/httpied --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: httpied-Linux
           path: dist/*

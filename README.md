@@ -9,7 +9,7 @@ The desktop uses egui/winit/OpenGL with native accessibility support.
 
 From a packaged archive, run `./httpied` on Linux or `httpied.exe` on Windows.
 
-To build from source, install stable Rust and a C/C++ build toolchain, then run:
+To build from source, install Rust **1.95 or newer** and a C/C++ build toolchain, then run:
 
 ```sh
 cargo run --locked --release --features ui
@@ -123,6 +123,32 @@ The native executable is `target/release/httpied` on Linux and
 `target\release\httpied.exe` on Windows. Linux needs X11 or Wayland and OpenGL/EGL drivers.
 Windows builds use stable Rust's MSVC toolchain and Visual Studio C++ Build Tools.
 Loopback is required for the listener; port `0` chooses an available port.
+
+## Debian 13 (Trixie) / Secbian builds
+
+Trixie's packaged Rust 1.85 is too old for the UI dependencies. Use `rustup` to
+install a newer compiler while keeping Debian's system libraries:
+
+```sh
+sudo apt update
+sudo apt install rustup ca-certificates build-essential pkg-config \
+  libx11-dev libxi-dev libgl1-mesa-dev libxkbcommon-dev libwayland-dev libnss3-tools
+rustup toolchain install 1.95.0 --profile minimal
+rustup run 1.95.0 cargo build --locked --release --features ui --bin httpied
+./target/release/httpied
+```
+
+Debian's `rustup` package replaces the distribution's `cargo`/`rustc` packages;
+APT will show the proposed replacements. If you already installed rustup from
+[rust-lang.org](https://rust-lang.org/tools/install/), keep that installation and
+omit `rustup` from the APT command.
+
+Build on Trixie (or inside a Trixie container) for Secbian. Binaries built on a
+newer distribution can require newer GLIBC symbols and fail on Trixie's GLIBC
+2.41. Installing a newer Rust compiler on Trixie does not upgrade its GLIBC.
+CI's Linux archive is built with Rust 1.95.0 inside a Trixie container. Local
+packaging uses the host's libraries, so its compatibility depends on the build
+host. Keep the existing dependency lockfile and use `--locked`.
 
 ## Validation and packaging
 
