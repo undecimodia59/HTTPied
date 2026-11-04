@@ -1,5 +1,7 @@
 use crate::model::*;
 use std::{io, net::SocketAddr, time::Duration};
+use tracing::Instrument;
+static CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -10,6 +12,7 @@ use tokio::{
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub resolver: crate::resolver::Resolver,
     pub interception: Option<crate::control::Interception>,
     pub policy: Option<watch::Receiver<std::sync::Arc<crate::policy::Policy>>>,
     pub events: Option<mpsc::Sender<Event>>,
@@ -30,6 +33,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            resolver: Default::default(),
             interception: None,
             policy: None,
             events: None,
@@ -52,6 +56,9 @@ impl Default for Config {
 fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg)
 }
+pub(crate) fn phase_error(phase: &str, target: &str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{phase} [{target}]: {error}"))
+}
 
 pub async fn bind(config: &Config) -> io::Result<TcpListener> {
     if !config.listen.ip().is_loopback() || config.max_connections == 0 {
@@ -71,6 +78,7 @@ pub async fn serve(
     mut stop: watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut config = config;
+    tracing::info!(listen=%listener.local_addr()?,max_connections=config.max_connections,connect_timeout_ms=config.connect_timeout.as_millis(),idle_timeout_ms=config.idle_timeout.as_millis(),total_timeout_ms=config.total_timeout.as_millis(),"proxy service starting");
     config.events = Some(events.clone());
     let mut tasks = JoinSet::new();
     let result = loop {
@@ -84,23 +92,27 @@ pub async fn serve(
                 if let Some(Err(e)) = result { break Err(io::Error::other(e)); }
             }
             accepted = listener.accept(), if tasks.len() < config.max_connections => {
-                let (mut socket, _) = match accepted { Ok(v) => v, Err(e) => break Err(e) };
+                let (mut socket, peer) = match accepted { Ok(v) => v, Err(e) => break Err(e) };
                 let cfg = config.clone();
                 let tx = events.clone();
+                let connection_id=CONNECTION_ID.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+                let span=tracing::info_span!("proxy_connection",connection_id,%peer);
                 tasks.spawn(async move {
+                    tracing::debug!("client TCP connection accepted");
                     let event=match exchange(&mut socket,&cfg).await {
                         Ok(event)=>event,
-                        Err(error) if error.kind()==io::ErrorKind::NotConnected=>return,
-                        Err(error)=>{let message=error.to_string();tracing::warn!(%message,"proxy exchange failed");Event::Error(message)}
+                        Err(error) if error.kind()==io::ErrorKind::NotConnected=>{tracing::debug!(%error,"client connection ended without a standalone capture");return},
+                        Err(error)=>{let message=format!("Connection {connection_id} (client {peer}): {error}");tracing::warn!(%message,error_kind=?error.kind(),error_debug=?error,"proxy exchange failed");Event::Error(message)}
                     };
                     drop(socket);
                     let _ = tx.send(event).await;
-                });
+                }.instrument(span));
             }
         }
     };
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    tracing::info!(result=?result,"proxy service stopped");
     result
 }
 
@@ -498,6 +510,7 @@ async fn prepare_context(
 }
 
 async fn forward(client: &mut TcpStream, cfg: &Config, mut p: Prepared) -> io::Result<Event> {
+    tracing::debug!(authority=%p.authority,method=%p.parsed.method,target=%p.parsed.target,tunnel=p.tunnel,"request prepared for forwarding");
     p.started = std::time::Instant::now();
     let mut upstream = match connect(&p, cfg).await {
         Ok(upstream) => upstream,
@@ -525,6 +538,7 @@ async fn forward(client: &mut TcpStream, cfg: &Config, mut p: Prepared) -> io::R
                 }
             };
             let acceptor = ca.acceptor(host).await?;
+            tracing::debug!(authority=%p.authority,"sending CONNECT success; awaiting downstream TLS handshake");
             client
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await?;
@@ -532,7 +546,30 @@ async fn forward(client: &mut TcpStream, cfg: &Config, mut p: Prepared) -> io::R
                 prefix: std::io::Cursor::new(p.outgoing),
                 socket: client,
             };
-            let mut downstream = timeout(cfg.connect_timeout, acceptor.accept(prefixed)).await??;
+            let started = std::time::Instant::now();
+            let result = timeout(cfg.connect_timeout, acceptor.accept(prefixed)).await;
+            match &result {
+                Ok(Ok(stream)) => {
+                    tracing::debug!(authority=%p.authority,elapsed_ms=started.elapsed().as_millis(),alpn=?stream.get_ref().1.alpn_protocol().map(String::from_utf8_lossy),"downstream TLS handshake completed")
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(authority=%p.authority,elapsed_ms=started.elapsed().as_millis(),error_kind=?error.kind(),%error,error_debug=?error,"downstream TLS handshake failed")
+                }
+                Err(error) => {
+                    tracing::warn!(authority=%p.authority,elapsed_ms=started.elapsed().as_millis(),%error,"downstream TLS handshake timed out")
+                }
+            }
+            let mut downstream = result
+                .map_err(|error| {
+                    phase_error(
+                        "Client TLS handshake timeout",
+                        p.authority.as_str(),
+                        error.into(),
+                    )
+                })?
+                .map_err(|error| {
+                    phase_error("Client TLS handshake", p.authority.as_str(), error)
+                })?;
             if downstream.get_ref().1.alpn_protocol() == Some(b"h2".as_slice()) {
                 crate::protocols::h2(
                     downstream,
@@ -540,14 +577,20 @@ async fn forward(client: &mut TcpStream, cfg: &Config, mut p: Prepared) -> io::R
                     cfg.clone(),
                     Some(Box::new(origin)),
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    phase_error("Client HTTP/2 connection", p.authority.as_str(), error)
+                })?;
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
                     "HTTP/2 connection closed",
                 ));
             }
-            let mut prepared =
-                prepare_context(&mut downstream, cfg, Some(p.authority.as_str())).await?;
+            let mut prepared = prepare_context(&mut downstream, cfg, Some(p.authority.as_str()))
+                .await
+                .map_err(|error| {
+                    phase_error("Client HTTPS request read", p.authority.as_str(), error)
+                })?;
             intercept_request(&mut downstream, cfg, &mut prepared).await?;
             prepared.started = std::time::Instant::now();
             if is_websocket(&prepared) {
@@ -639,47 +682,91 @@ async fn forward(client: &mut TcpStream, cfg: &Config, mut p: Prepared) -> io::R
     }
 }
 async fn connect(p: &Prepared, cfg: &Config) -> io::Result<TcpStream> {
-    let host = p
+    let host = p.authority.host().trim_matches(['[', ']']);
+    let port = p
         .authority
-        .host()
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    match timeout(
-        cfg.connect_timeout,
-        TcpStream::connect((
-            host,
-            p.authority
-                .port_u16()
-                .unwrap_or(if p.parsed.target.starts_with("https:") {
-                    443
-                } else {
-                    80
-                }),
-        )),
+        .port_u16()
+        .unwrap_or(if p.parsed.target.starts_with("https:") {
+            443
+        } else {
+            80
+        });
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + cfg.connect_timeout;
+    tracing::debug!(%host,port,budget_ms=cfg.connect_timeout.as_millis(),"DNS/TCP connect started");
+    let addresses = match tokio::time::timeout_at(
+        deadline,
+        cfg.resolver.resolve(host, port, cfg.connect_timeout),
     )
     .await
     {
-        Ok(Ok(stream)) => Ok(stream),
-        Ok(Err(error)) => Err(io::Error::new(
-            error.kind(),
-            format!(
-                "Cannot connect to {}: {}{}",
-                p.authority,
-                error,
-                if error.kind() == io::ErrorKind::ConnectionRefused {
-                    ". Check the target host/port and whether its server is running."
-                } else {
-                    ""
+        Ok(Ok(addresses)) => addresses,
+        result => {
+            let error = match result {
+                Ok(Err(error)) => error,
+                Err(_) => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "DNS lookup for {host} exceeded {:?}; no TCP connection was attempted",
+                        cfg.connect_timeout
+                    ),
+                ),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            tracing::warn!(authority=%p.authority,elapsed_ms=started.elapsed().as_millis(),error_kind=?error.kind(),%error,"DNS resolution failed before TCP connect");
+            return Err(error);
+        }
+    };
+    let dial = async {
+        let mut last = None;
+        for (index, address) in addresses.iter().copied().enumerate() {
+            let attempt = std::time::Instant::now();
+            tracing::debug!(%address,index,"TCP address attempt started");
+            match TcpStream::connect(address).await {
+                Ok(stream) => {
+                    tracing::debug!(%address,index,elapsed_ms=attempt.elapsed().as_millis(),local=?stream.local_addr(),peer=?stream.peer_addr(),"TCP address attempt connected");
+                    return Ok(stream);
                 }
-            ),
-        )),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!(
-                "Connection to {} exceeded {:?}",
-                p.authority, cfg.connect_timeout
-            ),
-        )),
+                Err(error) => {
+                    tracing::debug!(%address,index,elapsed_ms=attempt.elapsed().as_millis(),error_kind=?error.kind(),%error,"TCP address attempt failed");
+                    last = Some(error);
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            io::Error::new(io::ErrorKind::AddrNotAvailable, "DNS returned no addresses")
+        }))
+    };
+    match tokio::time::timeout_at(deadline, dial).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => {
+            cfg.resolver.invalidate(host, port);
+            tracing::warn!(authority=%p.authority,elapsed_ms=started.elapsed().as_millis(),error_kind=?error.kind(),%error,"TCP connect failed after DNS resolution");
+            Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Cannot connect to {}: {}{}",
+                    p.authority,
+                    error,
+                    if error.kind() == io::ErrorKind::ConnectionRefused {
+                        ". Check the target host/port and whether its server is running."
+                    } else {
+                        ""
+                    }
+                ),
+            ))
+        }
+        Err(_) => {
+            cfg.resolver.invalidate(host, port);
+            tracing::warn!(authority=%p.authority,elapsed_ms=started.elapsed().as_millis(),"TCP connect timed out after DNS resolution");
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "TCP connection to {} exceeded {:?} including DNS",
+                    p.authority, cfg.connect_timeout
+                ),
+            ))
+        }
     }
 }
 
@@ -756,7 +843,27 @@ async fn http_exchange(
     sink: Option<&mut dyn crate::Transport>,
     started: &mut bool,
 ) -> io::Result<WireExecution> {
-    timeout(cfg.idle_timeout, upstream.write_all(&p.outgoing)).await??;
+    tracing::debug!(authority=%p.authority,method=%p.parsed.method,target=%p.parsed.target,request_bytes=p.outgoing.len(),"upstream HTTP request write started");
+    timeout(cfg.idle_timeout, upstream.write_all(&p.outgoing))
+        .await
+        .map_err(|error| {
+            phase_error(
+                "HTTP request write timeout",
+                p.authority.as_str(),
+                error.into(),
+            )
+        })?
+        .map_err(|error| phase_error("HTTP request write", p.authority.as_str(), error))?;
+    tracing::debug!(authority=%p.authority,"upstream HTTP request sent; awaiting response");
+    receive_exchange(p, upstream, cfg, sink, started).await
+}
+async fn receive_exchange(
+    p: Prepared,
+    upstream: &mut dyn crate::Transport,
+    cfg: &Config,
+    sink: Option<&mut dyn crate::Transport>,
+    started: &mut bool,
+) -> io::Result<WireExecution> {
     let response_offset_ms = p.started.elapsed().as_secs_f64() * 1000.0;
     let capture = timeout(
         cfg.total_timeout,
@@ -779,8 +886,9 @@ async fn http_exchange(
             ),
         )
     })?
-    .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", p.parsed.target)))?;
+    .map_err(|error| phase_error("HTTP response transfer", &p.parsed.target, error))?;
     let mime = response_mime(&capture.bytes);
+    tracing::debug!(authority=%p.authority,status=capture.status,total_bytes=capture.total,captured_bytes=capture.bytes.len(),truncated=capture.truncated,elapsed_ms=p.started.elapsed().as_millis(),"upstream HTTP response completed");
     let mut execution = WireExecution {
         original: OriginalCapture(p.bytes),
         parsed: p.parsed,
@@ -843,4 +951,77 @@ fn is_websocket(p: &Prepared) -> bool {
     p.parsed.headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("upgrade") && value.eq_ignore_ascii_case(b"websocket")
     })
+}
+
+/// A prepared HTTP/1.1 request whose final byte has not been written yet.
+pub(crate) struct StagedRace {
+    prepared: Prepared,
+    transport: Box<dyn crate::Transport>,
+}
+pub(crate) async fn stage_race(bytes: Vec<u8>, cfg: &Config) -> io::Result<StagedRace> {
+    timeout(cfg.total_timeout, async {
+        let p = prepare(&mut std::io::Cursor::new(bytes), cfg).await?;
+        if p.tunnel {
+            return Err(invalid("Race requests cannot use CONNECT"));
+        }
+        let tcp = connect(&p, cfg).await?;
+        let mut transport: Box<dyn crate::Transport> = if p.parsed.target.starts_with("https:") {
+            #[cfg(feature = "tls-spike")]
+            {
+                let host = p.authority.host().trim_matches(['[', ']']);
+                Box::new(if let Some(ca) = &cfg.ca {
+                    ca.connect(host, tcp, cfg.connect_timeout).await?
+                } else {
+                    crate::authority::Authority::connect_public(host, tcp, cfg.connect_timeout)
+                        .await?
+                })
+            }
+            #[cfg(not(feature = "tls-spike"))]
+            {
+                return Err(invalid("HTTPS requires TLS support"));
+            }
+        } else {
+            Box::new(tcp)
+        };
+        let prefix = p
+            .outgoing
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| invalid("Empty race request"))?;
+        timeout(cfg.idle_timeout, async {
+            transport.write_all(&p.outgoing[..prefix]).await?;
+            transport.flush().await
+        })
+        .await??;
+        Ok(StagedRace {
+            prepared: p,
+            transport,
+        })
+    })
+    .await?
+}
+impl StagedRace {
+    pub(crate) async fn release(
+        mut self,
+        cfg: Config,
+        origin: std::time::Instant,
+    ) -> io::Result<(WireExecution, u64)> {
+        timeout(cfg.total_timeout, async {
+            let offset = origin.elapsed().as_micros().min(u64::MAX as u128) as u64;
+            self.transport
+                .write_all(&self.prepared.outgoing[self.prepared.outgoing.len() - 1..])
+                .await?;
+            self.transport.flush().await?;
+            let execution = receive_exchange(
+                self.prepared,
+                self.transport.as_mut(),
+                &cfg,
+                None,
+                &mut false,
+            )
+            .await?;
+            Ok((execution, offset))
+        })
+        .await?
+    }
 }

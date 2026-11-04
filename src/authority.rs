@@ -27,6 +27,33 @@ impl std::fmt::Debug for Authority {
 fn error(e: impl std::fmt::Display) -> io::Error {
     io::Error::other(e.to_string())
 }
+async fn connect_logged(
+    connector: &TlsConnector,
+    host: &str,
+    stream: tokio::net::TcpStream,
+    deadline: Duration,
+) -> io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let started = std::time::Instant::now();
+    tracing::debug!(%host,peer=?stream.peer_addr(),budget_ms=deadline.as_millis(),"upstream TLS handshake started");
+    let name = ServerName::try_from(host.to_owned()).map_err(error)?;
+    let result = tokio::time::timeout(deadline, connector.connect(name, stream)).await;
+    match &result {
+        Ok(Ok(stream)) => {
+            tracing::debug!(%host,elapsed_ms=started.elapsed().as_millis(),alpn=?stream.get_ref().1.alpn_protocol().map(String::from_utf8_lossy),version=?stream.get_ref().1.protocol_version(),cipher=?stream.get_ref().1.negotiated_cipher_suite(),"upstream TLS handshake completed")
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(%host,elapsed_ms=started.elapsed().as_millis(),error_kind=?error.kind(),%error,error_debug=?error,"upstream TLS handshake failed")
+        }
+        Err(error) => {
+            tracing::warn!(%host,elapsed_ms=started.elapsed().as_millis(),%error,"upstream TLS handshake timed out")
+        }
+    }
+    result
+        .map_err(|error| {
+            crate::proxy::phase_error("Upstream TLS handshake timeout", host, error.into())
+        })?
+        .map_err(|error| crate::proxy::phase_error("Upstream TLS handshake", host, error))
+}
 impl Authority {
     pub fn open(path: &Path) -> io::Result<Self> {
         let key_path = path.join("ca.key.pem");
@@ -134,11 +161,7 @@ impl Authority {
         stream: tokio::net::TcpStream,
         deadline: Duration,
     ) -> io::Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
-        let name = ServerName::try_from(host.to_owned()).map_err(error)?;
-        tokio::time::timeout(deadline, self.connector.connect(name, stream))
-            .await
-            .map_err(error)?
-            .map_err(error)
+        connect_logged(&self.connector, host, stream, deadline).await
     }
     pub async fn connect_public(
         host: &str,
@@ -155,13 +178,12 @@ impl Authority {
         .map_err(error)?
         .with_root_certificates(roots)
         .with_no_client_auth();
-        let name = ServerName::try_from(host.to_owned()).map_err(error)?;
-        tokio::time::timeout(
+        connect_logged(
+            &TlsConnector::from(Arc::new(config)),
+            host,
+            stream,
             deadline,
-            TlsConnector::from(Arc::new(config)).connect(name, stream),
         )
         .await
-        .map_err(error)?
-        .map_err(error)
     }
 }
