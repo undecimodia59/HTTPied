@@ -36,8 +36,6 @@ def main():
     parser.add_argument("--attack-only", action="store_true")
     parser.add_argument("--jwt-only", action="store_true")
     parser.add_argument("--layout-only",action="store_true")
-    parser.add_argument("--history-only",action="store_true")
-    parser.add_argument("--review-only", action="store_true", help="check History search, saved actions and failed Replay views")
     parser.add_argument("--screenshots-dir", type=Path, default=Path("docs/screenshots"))
     args = parser.parse_args()
     args.attack_only = args.attack_only or args.jwt_only

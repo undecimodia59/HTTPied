@@ -1,7 +1,8 @@
 # HTTPied
 
 Native Rust HTTP(S) testing workspace for Windows and Linux. Projects keep captures,
-Replay drafts, scope, filters, variables and Intruder results in a local SQLite database.
+Replay and Coder workspaces, scope, filters, variables, and Intruder/Attack results in a local
+SQLite database.
 The desktop uses egui/winit/OpenGL with native accessibility support.
 
 ## Start
@@ -60,9 +61,27 @@ JWT inputs, output and signing keys are session-only.
 Select text with the mouse or **Shift+arrows**, right-click, and choose **Send selection to Coder**.
 Coder (**Ctrl+5**) supports Base64, Base64url, URL percent, form, HTML entities and hex. Binary
 results stay as exact bytes with a hex view; **Use as input** chains a result into another operation.
-Encoder input, input format, codec, last encode/decode choice and result view are saved with the project. In a message editor, **Set Compare baseline** followed by **Compare
-with baseline** opens the paired, highlighted comparison (**Ctrl+6**) with synchronized scrolling.
+Encoder input, input format, codec, last encode/decode choice and result view are saved with
+the project. In a message editor, **Set Compare baseline** followed by **Compare with baseline**
+opens the paired, highlighted comparison (**Ctrl+6**) with synchronized scrolling.
 You can also paste two messages directly into Compare.
+
+Request and response context menus offer **Add to scope → Host only / Host + subdomains**.
+For subdomains, **Site domain only / Site domain + subdomains** also let you add the registrable
+site domain, for example `domain.com` from `sub.domain.com`, or `example.co.uk` from
+`shop.example.co.uk`. The menu shows both target names before you choose. Site-domain lookup uses
+a bundled Public Suffix List, including private suffixes such as `github.io`, without network
+requests. Equivalent site actions are omitted when the host already is the site domain; IPs and
+single-label local names keep the host actions. Unknown suffixes follow the list's default rule,
+so CTF names such as `api.lab.htb` resolve to `lab.htb`. Subdomain options include the named host
+and its children. Existing inclusions are reused or expanded; explicit exclusions and restricted
+rules remain intact.
+
+Settings is the last workspace tab. Enable **Settings → Appearance → Wrap long lines by default**
+to wrap all message editors; individual panes also have a Wrap control/context-menu option.
+Right-click a request editor to send it to Replay, Intruder or Attack, preserving its destination.
+Click anywhere on an Intruder result row to inspect that payload's captured request and response;
+**Attack template** returns to the original template. Failed attempts show their recorded error.
 
 History offers independent Host, Endpoint and Destination columns. Drag header edges to
 resize; widths are saved with the project. Auto response views decode compressed content
@@ -125,22 +144,5 @@ The trust smoke also requires Chromium and OpenSSL. Both use isolated test trust
 Use `bash scripts/package-linux.sh` or `./scripts/package-windows.ps1` to create a
 local archive and checksum in `dist/`. Packages are unsigned; Windows runtime and
 Wayland interaction still require platform testing.
-
-Request and response context menus offer **Add to scope → Host only / Host + subdomains**.
-For subdomains, **Site domain only / Site domain + subdomains** also let you add the registrable
-site domain, for example `domain.com` from `sub.domain.com`, or `example.co.uk` from
-`shop.example.co.uk`. The menu shows both target names before you choose. Site-domain lookup uses
-a bundled Public Suffix List, including private suffixes such as `github.io`, without network
-requests. Equivalent site actions are omitted when the host already is the site domain; IPs and
-single-label local names keep the host actions. Unknown suffixes follow the list's default rule,
-so CTF names such as `api.lab.htb` resolve to `lab.htb`. Subdomain options include the named host
-and its children. Existing inclusions are reused or expanded; explicit exclusions and restricted
-rules remain intact.
-
-Settings is the last workspace tab. Enable **Settings → Appearance → Wrap long lines by default**
-to wrap all message editors; individual panes also have a Wrap control/context-menu option.
-Right-click a request editor to send its full request to Replay or Intruder, preserving its destination.
-Click anywhere on an Intruder result row to inspect that payload's captured request and response;
-**Attack template** returns to the original template. Failed attempts show their recorded error.
 
 Documentation and screenshot directories are local ignored artifacts and are not included in packages.
